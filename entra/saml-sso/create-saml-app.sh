@@ -92,7 +92,55 @@ ACCOUNT_JSON=$(az account show 2>/dev/null) || {
 TENANT_ID=$(echo "${ACCOUNT_JSON}" | grep -o '"tenantId": *"[^"]*"' | cut -d'"' -f4)
 echo "Logged in. Tenant: ${TENANT_ID}"
 
-APP_NAME="EKS Manager SAML — ${PROVIDER_NAME}"
+# Plain ASCII "--", not an em dash. The PowerShell script has to be ASCII to
+# parse under Windows PowerShell 5.1, and both scripts find an existing app by
+# this exact display name -- so if the two names differ, running one after the
+# other creates a second app registration instead of reusing the first.
+APP_NAME="EKS Manager SAML -- ${PROVIDER_NAME}"
+
+# Cognito's entity ID is urn:amazon:cognito:sp:<pool-id>, which contains no
+# verified domain, no tenant ID and no app ID — so newer tenants reject it under
+# their default application policy. Microsoft's own error says the restriction
+# may not apply when requestedAccessTokenVersion is 2, so that is set first and
+# the URI attempted afterwards. Order matters: Graph will not raise the token
+# version once a v1-style URI is already on the application.
+#
+# If it still fails, stop. Cognito requires its entity ID to match, and that
+# value cannot be changed — so an application without it looks created and
+# cannot federate.
+set_identifier_uri() {
+  local client_id="$1" uri="$2"
+
+  local object_id
+  object_id=$(az ad app show --id "${client_id}" --query "id" -o tsv) || {
+    echo "ERROR: could not read the object ID for app ${client_id}." >&2
+    exit 1
+  }
+
+  az rest --method PATCH \
+    --uri "https://graph.microsoft.com/v1.0/applications/${object_id}" \
+    --headers "Content-Type=application/json" \
+    --body '{"api":{"requestedAccessTokenVersion":2}}' >/dev/null
+
+  echo "Setting identifier URI ${uri} ..."
+  if ! az ad app update --id "${client_id}" --identifier-uris "${uri}" >/dev/null; then
+    cat >&2 <<EOF
+
+ERROR: the tenant refused the identifier URI '${uri}'.
+
+Cognito requires its entity ID to be the application's identifier URI, and that
+value cannot be changed — so SAML will not work until the tenant accepts it.
+
+An administrator needs to relax the identifier URI restriction for this tenant,
+or grant this application an exemption. See:
+  https://aka.ms/identifier-uri-formatting-error
+
+Microsoft's own message is printed above this one.
+EOF
+    exit 1
+  fi
+  echo "Identifier URI set."
+}
 
 # ── STEP 1 — App registration ────────────────────────────────────────────────
 
@@ -105,11 +153,12 @@ if [ -n "${EXISTING_APP_ID}" ] && [ "${EXISTING_APP_ID}" != "null" ]; then
   echo "App already exists. App ID: ${EXISTING_APP_ID}"
   CLIENT_ID="${EXISTING_APP_ID}"
 
-  echo "Updating redirect URI and identifier URI to match current Cognito config..."
+  echo "Updating redirect URI to match current Cognito config..."
   az ad app update --id "${CLIENT_ID}" \
     --web-redirect-uris "${COGNITO_ACS_URL}" \
-    --identifier-uris "${COGNITO_ENTITY_ID}" \
     >/dev/null
+
+  set_identifier_uri "${CLIENT_ID}" "${COGNITO_ENTITY_ID}"
 else
   echo "Creating app registration '${APP_NAME}'..."
   CLIENT_ID=$(az ad app create \
@@ -118,10 +167,14 @@ else
     --web-redirect-uris "${COGNITO_ACS_URL}" \
     --query "appId" -o tsv)
 
-  # identifier-uris must be set after creation — az ad app create doesn't accept it directly
-  az ad app update --id "${CLIENT_ID}" --identifier-uris "${COGNITO_ENTITY_ID}" >/dev/null
-
+  if [ -z "${CLIENT_ID}" ]; then
+    echo "ERROR: could not create the app registration." >&2
+    exit 1
+  fi
   echo "App created. App ID: ${CLIENT_ID}"
+
+  # identifier-uris must be set after creation — az ad app create doesn't accept it directly
+  set_identifier_uri "${CLIENT_ID}" "${COGNITO_ENTITY_ID}"
 fi
 
 # ── STEP 2 — Service principal with SAML SSO mode ───────────────────────────

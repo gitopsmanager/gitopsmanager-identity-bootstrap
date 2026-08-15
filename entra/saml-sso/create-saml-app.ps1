@@ -100,26 +100,153 @@ try {
     Write-Error "ERROR: Not logged in. Run: az login"
     exit 1
 }
+if (-not $account -or -not $account.tenantId) {
+    Write-Error "ERROR: Not logged in, or 'az account show' returned nothing. Run: az login"
+    exit 1
+}
 $TenantId = $account.tenantId
 Write-Host "Logged in. Tenant: $TenantId"
 
 $AppName = "EKS Manager SAML -- $ProviderName"
+
+
+# Runs az, captures stdout, and reports the exit code.
+#
+# Deliberately does NOT redirect stderr. Under Windows PowerShell 5.1 every form
+# of redirecting a native command's stderr causes trouble, and this script runs
+# with $ErrorActionPreference = "Stop":
+#
+#   2>&1              wraps each stderr line in an ErrorRecord, so az's routine
+#                     warnings arrive glued to the front of the JSON.
+#   2>file, 2>$null   raise a terminating NativeCommandError on the first line
+#                     az writes to stderr -- so any exit-code check placed after
+#                     the call never runs at all. This is how an earlier version
+#                     of this script printed "SAML SSO mode set." immediately
+#                     after the call that set nothing.
+#
+# Left alone, stderr goes straight to the console: the user reads Microsoft's
+# error verbatim, multi-line and unmangled, while $stdout stays clean enough to
+# hand to ConvertFrom-Json. The exit code is what decides control flow.
+function Invoke-Az {
+    param([string[]] $Arguments)
+
+    $stdout = & az @Arguments
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = ($stdout | Out-String).Trim()
+    }
+}
+
+# Passing JSON to a native command from PowerShell is where this used to fail.
+# PowerShell does not escape embedded double quotes when handing arguments to an
+# executable, so az received {key:value} rather than {"key":"value"} and Graph
+# answered "Unable to read JSON request payload" -- while the script printed
+# success on the very next line. Writing the body to a file and using az's
+# documented @file syntax sidesteps the quoting entirely.
+function Invoke-GraphJson {
+    param(
+        [string]    $Method,
+        [string]    $Uri,
+        [hashtable] $Body,
+        [switch]    $AllowFailure
+    )
+
+    $bodyFile = New-TemporaryFile
+    try {
+        ($Body | ConvertTo-Json -Compress -Depth 6) |
+            Set-Content -Path $bodyFile.FullName -Encoding ascii
+
+        $result = Invoke-Az @(
+            'rest', '--method', $Method, '--uri', $Uri,
+            '--headers', 'Content-Type=application/json',
+            '--body', "@$($bodyFile.FullName)"
+        )
+
+        if ($result.ExitCode -ne 0) {
+            if ($AllowFailure) { return $null }
+            Write-Error "ERROR: $Method $Uri failed -- az reported the reason above."
+            exit 1
+        }
+
+        # 204 No Content is the normal answer to a successful PATCH.
+        if (-not $result.Output) { return $null }
+        return ($result.Output | ConvertFrom-Json)
+    }
+    finally { Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue }
+}
+
+# Cognito's entity ID is urn:amazon:cognito:sp:<pool-id>, which contains no
+# verified domain, no tenant ID and no app ID -- so newer tenants reject it under
+# their default application policy. Microsoft's own error says the restriction
+# may not apply when requestedAccessTokenVersion is 2, so that is set first and
+# the URI attempted afterwards.
+#
+# If it still fails, stop. Cognito requires its entity ID to match, and it cannot
+# be changed -- so an application without it looks created and cannot federate.
+function Set-IdentifierUri {
+    param([string] $ClientId, [string] $Uri)
+
+    $objectId = az ad app show --id $ClientId --query "id" -o tsv
+    if ($LASTEXITCODE -ne 0 -or -not $objectId) {
+        Write-Error "ERROR: could not read the object ID for app $ClientId."
+        exit 1
+    }
+
+    # Order matters: the token version has to be raised while identifierUris is
+    # still empty. Graph will not accept the change once a v1-style URI is on the
+    # application.
+    Invoke-GraphJson -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/applications/$objectId" `
+        -Body @{ api = @{ requestedAccessTokenVersion = 2 } } | Out-Null
+
+    Write-Host "Setting identifier URI $Uri ..."
+    $result = Invoke-Az @('ad', 'app', 'update', '--id', $ClientId, '--identifier-uris', $Uri)
+
+    if ($result.ExitCode -ne 0) {
+        Write-Error "ERROR: the tenant refused the identifier URI '$Uri'.
+
+Cognito requires its entity ID to be the application's identifier URI, and that
+value cannot be changed -- so SAML will not work until the tenant accepts it.
+
+An administrator needs to relax the identifier URI restriction for this tenant,
+or grant this application an exemption. See:
+  https://aka.ms/identifier-uri-formatting-error
+
+Microsoft's own message is printed directly above this one."
+        exit 1
+    }
+    Write-Host "Identifier URI set."
+}
 
 # -- STEP 1 -- App registration ------------------------------------------------
 
 Write-Host ""
 Write-Host "Step 1/5 -- Checking for existing app registration '$AppName'..."
 
-$existingApp = az ad app list --display-name "$AppName" --query "[0]" | ConvertFrom-Json
+# A failed lookup must not fall through to the create branch. "Could not tell"
+# and "does not exist" are different answers, and treating the first as the
+# second creates a second app registration alongside the working one.
+$appList = Invoke-Az @('ad', 'app', 'list', '--display-name', $AppName, '--query', '[0]')
+if ($appList.ExitCode -ne 0) {
+    Write-Error "ERROR: could not list app registrations -- az reported the reason above.
+Re-running is safe; this stops rather than risk creating a duplicate of '$AppName'."
+    exit 1
+}
+$existingApp = if ($appList.Output) { $appList.Output | ConvertFrom-Json } else { $null }
 
 if ($existingApp) {
     $ClientId = $existingApp.appId
     Write-Host "App already exists. App ID: $ClientId"
 
-    Write-Host "Updating redirect URI and identifier URI to match current Cognito config..."
-    az ad app update --id $ClientId `
-        --web-redirect-uris $CognitoAcsUrl `
-        --identifier-uris $CognitoEntityId | Out-Null
+    Write-Host "Updating redirect URI to match current Cognito config..."
+    $update = Invoke-Az @('ad', 'app', 'update', '--id', $ClientId, '--web-redirect-uris', $CognitoAcsUrl)
+    if ($update.ExitCode -ne 0) {
+        Write-Error "ERROR: could not set the redirect URI on app $ClientId.
+Cognito posts its SAML response to $CognitoAcsUrl -- sign-in fails without it."
+        exit 1
+    }
+
+    Set-IdentifierUri -ClientId $ClientId -Uri $CognitoEntityId
 } else {
     Write-Host "Creating app registration '$AppName'..."
     $ClientId = az ad app create `
@@ -127,11 +254,13 @@ if ($existingApp) {
         --sign-in-audience "AzureADMyOrg" `
         --web-redirect-uris $CognitoAcsUrl `
         --query "appId" -o tsv
-
-    # identifier-uris must be set after creation
-    az ad app update --id $ClientId --identifier-uris $CognitoEntityId | Out-Null
-
+    if ($LASTEXITCODE -ne 0 -or -not $ClientId) {
+        Write-Error "ERROR: could not create the app registration."
+        exit 1
+    }
     Write-Host "App created. App ID: $ClientId"
+
+    Set-IdentifierUri -ClientId $ClientId -Uri $CognitoEntityId
 }
 
 # -- STEP 2 -- Service principal with SAML SSO mode ---------------------------
@@ -139,7 +268,12 @@ if ($existingApp) {
 Write-Host ""
 Write-Host "Step 2/5 -- Checking for existing service principal..."
 
-$existingSp = az ad sp list --filter "appId eq '$ClientId'" --query "[0]" | ConvertFrom-Json
+$spList = Invoke-Az @('ad', 'sp', 'list', '--filter', "appId eq '$ClientId'", '--query', '[0]')
+if ($spList.ExitCode -ne 0) {
+    Write-Error "ERROR: could not list service principals -- az reported the reason above."
+    exit 1
+}
+$existingSp = if ($spList.Output) { $spList.Output | ConvertFrom-Json } else { $null }
 
 if ($existingSp) {
     $SpObjectId = $existingSp.id
@@ -147,6 +281,10 @@ if ($existingSp) {
 } else {
     Write-Host "Creating service principal..."
     $SpObjectId = az ad sp create --id $ClientId --query "id" -o tsv
+    if ($LASTEXITCODE -ne 0 -or -not $SpObjectId) {
+        Write-Error "ERROR: could not create the service principal for app $ClientId."
+        exit 1
+    }
     Write-Host "Service principal created. Object ID: $SpObjectId"
 }
 
@@ -155,12 +293,11 @@ $ssoBody = @{
     preferredSingleSignOnMode = "saml"
     loginUrl                  = $CognitoSignOnUrl
     appRoleAssignmentRequired = $false
-} | ConvertTo-Json -Compress
+}
 
-az rest --method PATCH `
-    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId" `
-    --headers "Content-Type=application/json" `
-    --body $ssoBody
+Invoke-GraphJson -Method PATCH `
+    -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId" `
+    -Body $ssoBody | Out-Null
 Write-Host "SAML SSO mode set."
 
 # -- STEP 3 -- Token signing certificate ---------------------------------------
@@ -168,9 +305,16 @@ Write-Host "SAML SSO mode set."
 Write-Host ""
 Write-Host "Step 3/5 -- Checking for existing token signing certificate..."
 
-$existingCerts = az rest --method GET `
-    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/tokenSigningCertificates" `
-    | ConvertFrom-Json
+# A service principal created moments ago has no tokenSigningCertificates
+# collection at all, and Graph answers 404 rather than an empty list. That is the
+# normal first-run path, so a non-zero exit here means "none yet", not a failure.
+$certsResult = Invoke-Az @(
+    'rest', '--method', 'GET',
+    '--uri', "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/tokenSigningCertificates"
+)
+$existingCerts = if ($certsResult.ExitCode -eq 0 -and $certsResult.Output) {
+    $certsResult.Output | ConvertFrom-Json
+} else { $null }
 
 if ($existingCerts.value -and $existingCerts.value.Count -gt 0) {
     Write-Host "Token signing certificate already exists. Thumbprint: $($existingCerts.value[0].thumbprint)"
@@ -178,17 +322,18 @@ if ($existingCerts.value -and $existingCerts.value.Count -gt 0) {
 } else {
     Write-Host "Creating self-signed token signing certificate..."
     $expiry = (Get-Date).AddYears(3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $certBody = @{
-        displayName = "CN=EKS Manager SAML Signing"
-        endDateTime = $expiry
-    } | ConvertTo-Json -Compress
-
-    $certResult = az rest --method POST `
-        --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/addTokenSigningCertificate" `
-        --headers "Content-Type=application/json" `
-        --body $certBody | ConvertFrom-Json
+    $certResult = Invoke-GraphJson -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/addTokenSigningCertificate" `
+        -Body @{
+            displayName = "CN=EKS Manager SAML Signing"
+            endDateTime = $expiry
+        }
 
     $CertValue = $certResult.key
+    if (-not $CertValue) {
+        Write-Error "ERROR: the certificate call returned no key -- nothing to report to GitOps Manager."
+        exit 1
+    }
     Write-Host "Certificate created."
 }
 
