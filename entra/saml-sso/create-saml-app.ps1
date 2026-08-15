@@ -19,7 +19,7 @@
       5. POSTs the resulting app ID, entity ID, federation metadata URL and
          signing certificate to the EKS Manager API
 
-    Idempotent — safe to re-run. If the app already exists it is reused.
+    Idempotent -- safe to re-run. If the app already exists it is reused.
 
 .NOTES
     PREREQUISITES
@@ -27,20 +27,20 @@
       - Signed in user must hold the Cloud Application Administrator directory
         role (or higher, e.g. Global Administrator)
       - Network egress from wherever this script runs must be reachable by
-        the client's EKS Manager API — if the API sits behind an IP
+        the client's EKS Manager API -- if the API sits behind an IP
         allowlist, run this from a host whose public IP is already
         allowlisted (the same NAT Gateway IP used by the eksmanager-bootstrap
-        CodeBuild pipeline satisfies this — see
+        CodeBuild pipeline satisfies this -- see
         the root README.md)
 
     USAGE
-      This script reads everything from environment variables — nothing is
+      This script reads everything from environment variables -- nothing is
       typed or stored in the file itself, so it's reusable as-is across
       every client. Set the required variables, then run:
         .\create-saml-app.ps1
 
       Get the export block to copy-paste from Settings -> Terraform tile in
-      your EKS Manager dashboard — it provides ready-to-paste PowerShell
+      your EKS Manager dashboard -- it provides ready-to-paste PowerShell
       $env: assignments for all EKSMANAGER_* values and the SAML-specific
       values shown under "topology.json - example" -> the "saml" section.
 
@@ -58,8 +58,8 @@
 
 $ErrorActionPreference = "Stop"
 
-# ── CONFIGURATION ─────────────────────────────────────────────────────────────
-# Everything is read from the environment — nothing is stored in this file.
+# -- CONFIGURATION -------------------------------------------------------------
+# Everything is read from the environment -- nothing is stored in this file.
 
 $ProviderName            = if ($env:PROVIDER_NAME) { $env:PROVIDER_NAME } else { "EntraSAML" }
 $CognitoAcsUrl            = $env:COGNITO_ACS_URL
@@ -70,7 +70,7 @@ $EksManagerClientId       = $env:EKSMANAGER_CLIENT_ID
 $EksManagerClientSecret   = $env:EKSMANAGER_CLIENT_SECRET
 $EksManagerCognitoUrl     = $env:EKSMANAGER_COGNITO_URL
 
-# ── VALIDATION ─────────────────────────────────────────────────────────────────
+# -- VALIDATION -----------------------------------------------------------------
 
 $required = @{
     COGNITO_ACS_URL          = $CognitoAcsUrl
@@ -83,7 +83,7 @@ $required = @{
 }
 foreach ($key in $required.Keys) {
     if ([string]::IsNullOrWhiteSpace($required[$key])) {
-        Write-Error "ERROR: $key is not set. Export it before running this script — see USAGE at the top of the file."
+        Write-Error "ERROR: $key is not set. Export it before running this script -- see USAGE at the top of the file."
         exit 1
     }
 }
@@ -103,12 +103,12 @@ try {
 $TenantId = $account.tenantId
 Write-Host "Logged in. Tenant: $TenantId"
 
-$AppName = "EKS Manager SAML — $ProviderName"
+$AppName = "EKS Manager SAML -- $ProviderName"
 
-# ── STEP 1 — App registration ────────────────────────────────────────────────
+# -- STEP 1 -- App registration ------------------------------------------------
 
 Write-Host ""
-Write-Host "Step 1/5 — Checking for existing app registration '$AppName'..."
+Write-Host "Step 1/5 -- Checking for existing app registration '$AppName'..."
 
 $existingApp = az ad app list --display-name "$AppName" --query "[0]" | ConvertFrom-Json
 
@@ -134,10 +134,10 @@ if ($existingApp) {
     Write-Host "App created. App ID: $ClientId"
 }
 
-# ── STEP 2 — Service principal with SAML SSO mode ───────────────────────────
+# -- STEP 2 -- Service principal with SAML SSO mode ---------------------------
 
 Write-Host ""
-Write-Host "Step 2/5 — Checking for existing service principal..."
+Write-Host "Step 2/5 -- Checking for existing service principal..."
 
 $existingSp = az ad sp list --filter "appId eq '$ClientId'" --query "[0]" | ConvertFrom-Json
 
@@ -163,10 +163,10 @@ az rest --method PATCH `
     --body $ssoBody
 Write-Host "SAML SSO mode set."
 
-# ── STEP 3 — Token signing certificate ───────────────────────────────────────
+# -- STEP 3 -- Token signing certificate ---------------------------------------
 
 Write-Host ""
-Write-Host "Step 3/5 — Checking for existing token signing certificate..."
+Write-Host "Step 3/5 -- Checking for existing token signing certificate..."
 
 $existingCerts = az rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/tokenSigningCertificates" `
@@ -192,10 +192,10 @@ if ($existingCerts.value -and $existingCerts.value.Count -gt 0) {
     Write-Host "Certificate created."
 }
 
-# ── STEP 4 — Get M2M bearer token ────────────────────────────────────────────
+# -- STEP 4 -- Get M2M bearer token --------------------------------------------
 
 Write-Host ""
-Write-Host "Step 4/5 — Obtaining M2M bearer token..."
+Write-Host "Step 4/5 -- Obtaining M2M bearer token..."
 
 $tokenResponse = Invoke-RestMethod -Method Post `
     -Uri "$EksManagerCognitoUrl/oauth2/token" `
@@ -212,10 +212,10 @@ if ([string]::IsNullOrWhiteSpace($Token)) {
     exit 1
 }
 
-# ── STEP 5 — Report SAML status to EKS Manager ───────────────────────────
+# -- STEP 5 -- Report SAML status to EKS Manager ---------------------------
 
 Write-Host ""
-Write-Host "Step 5/5 — Reporting SAML configuration to EKS Manager..."
+Write-Host "Step 5/5 -- Reporting SAML configuration to EKS Manager..."
 
 $EntityId    = "https://sts.windows.net/$TenantId/"
 $MetadataUrl = "https://login.microsoftonline.com/$TenantId/federationmetadata/2007-06/federationmetadata.xml?appid=$ClientId"
