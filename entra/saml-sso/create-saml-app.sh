@@ -241,11 +241,17 @@ echo "Step 3/5 — Checking for existing token signing certificate..."
 #
 # Each certificate appears as two entries: usage "Verify" (the public half,
 # which is the only one Graph returns a key for) and usage "Sign".
-NOW_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+# A certificate inside the last 30 days does not count as reusable, so re-running
+# this close to expiry issues a replacement instead. That is the whole rotation
+# path: GitOps Manager warns from 30 days out, the operator re-runs, a new
+# certificate is issued, made active and reported. Reusing anything still
+# technically valid would leave that warning with no action that clears it.
+ROTATE_BEFORE=$(date -u -d '+30 days' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+  || date -u -v+30d '+%Y-%m-%dT%H:%M:%SZ')
 
 CERT_VALUE=$(az rest --method GET \
   --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}?\$select=keyCredentials" \
-  --query "reverse(sort_by(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${NOW_UTC}'], &endDateTime))[0].key" \
+  --query "reverse(sort_by(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${ROTATE_BEFORE}'], &endDateTime))[0].key" \
   -o tsv)
 
 if [ -n "${CERT_VALUE}" ] && [ "${CERT_VALUE}" != "null" ]; then
@@ -253,15 +259,21 @@ if [ -n "${CERT_VALUE}" ] && [ "${CERT_VALUE}" != "null" ]; then
 
   CERT_COUNT=$(az rest --method GET \
     --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}?\$select=keyCredentials" \
-    --query "length(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${NOW_UTC}'])" \
+    --query "length(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${ROTATE_BEFORE}'])" \
     -o tsv)
 
+  # The portal cannot fix this. Its SAML certificate UI is only offered for
+  # non-gallery applications; an app registered in this same tenant gets the
+  # OpenID Connect page instead, with no certificate list at all.
   if [ "${CERT_COUNT}" -gt 1 ] 2>/dev/null; then
     echo ""
-    echo "NOTE: this application has ${CERT_COUNT} valid signing certificates."
-    echo "      Earlier versions of this script added one per run. Only one should be"
-    echo "      active — remove the rest under Entra > Enterprise applications >"
-    echo "      '${APP_NAME}' > Single sign-on > SAML Certificates."
+    echo "NOTE: this application has ${CERT_COUNT} valid signing certificates, and the"
+    echo "      federation metadata advertises every one of them. Earlier versions of"
+    echo "      this script added one per run."
+    echo ""
+    echo "      Sign-in is unaffected — the active certificate signs, and the rest are"
+    echo "      accepted but unused. To get back to one, delete this application and"
+    echo "      re-run this script; it is idempotent and will create exactly one."
     echo ""
   fi
 else

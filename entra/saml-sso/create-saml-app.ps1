@@ -338,12 +338,26 @@ if ($spResult.ExitCode -ne 0) {
 }
 $spInfo = $spResult.Output | ConvertFrom-Json
 
-$nowUtc = (Get-Date).ToUniversalTime()
+# A certificate inside the last 30 days does not count as reusable, so re-running
+# this close to expiry issues a replacement instead. That is the whole rotation
+# path: GitOps Manager warns from 30 days out, the operator re-runs, a new
+# certificate is issued, made active and reported. Reusing anything still
+# technically valid would leave that warning with no action that clears it.
+$nowUtc      = (Get-Date).ToUniversalTime()
+$rotateBefore = $nowUtc.AddDays(30)
+
 $existingCerts = @($spInfo.keyCredentials | Where-Object {
     $_.usage -eq 'Verify' -and
     $_.type  -eq 'AsymmetricX509Cert' -and
     $_.key -and
-    ([datetime]$_.endDateTime).ToUniversalTime() -gt $nowUtc
+    ([datetime]$_.endDateTime).ToUniversalTime() -gt $rotateBefore
+})
+
+# Distinguishes "first run" from "rotating" in the message below.
+$expiringCerts = @($spInfo.keyCredentials | Where-Object {
+    $_.usage -eq 'Verify' -and
+    $_.type  -eq 'AsymmetricX509Cert' -and
+    ([datetime]$_.endDateTime).ToUniversalTime() -le $rotateBefore
 })
 
 if ($existingCerts.Count -gt 0) {
@@ -355,17 +369,40 @@ if ($existingCerts.Count -gt 0) {
     $CertValue = $activeCert.key
 
     if ($existingCerts.Count -gt 1) {
+        # The portal cannot fix this. Its SAML certificate UI is only offered for
+        # non-gallery applications; an app registered in this same tenant gets the
+        # OpenID Connect page instead, with no certificate list at all.
         Write-Host ""
-        Write-Host "NOTE: this application has $($existingCerts.Count) valid signing certificates."
-        Write-Host "      Earlier versions of this script added one per run. Only one should be"
-        Write-Host "      active -- remove the rest under Entra > Enterprise applications >"
-        Write-Host "      '$AppName' > Single sign-on > SAML Certificates."
+        Write-Host "NOTE: this application has $($existingCerts.Count) valid signing certificates, and the"
+        Write-Host "      federation metadata advertises every one of them. Earlier versions of"
+        Write-Host "      this script added one per run."
+        Write-Host ""
+        Write-Host "      Sign-in is unaffected -- the active certificate signs, and the rest are"
+        Write-Host "      accepted but unused. To get back to one, delete this application and"
+        Write-Host "      re-run this script; it is idempotent and will create exactly one."
         if (-not $spInfo.preferredTokenSigningKeyThumbprint) {
             Write-Host "      No active certificate is designated, so which one signs is undefined."
         }
         Write-Host ""
     }
 } else {
+    if ($expiringCerts.Count -gt 0) {
+        $soonest = $expiringCerts |
+            Sort-Object { [datetime]$_.endDateTime } -Descending |
+            Select-Object -First 1
+        $daysLeft = [int][math]::Ceiling((([datetime]$soonest.endDateTime).ToUniversalTime() - $nowUtc).TotalDays)
+
+        Write-Host ""
+        if ($daysLeft -le 0) {
+            Write-Host "The existing signing certificate EXPIRED on $($soonest.endDateTime)."
+        } else {
+            Write-Host "The existing signing certificate expires in $daysLeft day(s), on $($soonest.endDateTime)."
+        }
+        Write-Host "Issuing a replacement and making it the active signing key."
+        Write-Host "The old certificate stays until it expires, so sign-in is not interrupted."
+        Write-Host ""
+    }
+
     Write-Host "Creating self-signed token signing certificate..."
     $expiry = (Get-Date).AddYears(3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $certResult = Invoke-GraphJson -Method POST `
