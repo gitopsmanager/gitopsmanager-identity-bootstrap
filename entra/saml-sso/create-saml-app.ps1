@@ -295,6 +295,23 @@ $ssoBody = @{
     appRoleAssignmentRequired = $false
 }
 
+# The Entra portal's "Enterprise applications" list defaults to filtering on
+# Application type = Enterprise Applications, which shows only service
+# principals carrying this tag. One created by the CLI has no tags, so it is
+# invisible there -- the administrator sees the app registration and concludes
+# the enterprise application was never created. It was; the list is filtered.
+#
+# Tags are replaced wholesale by PATCH, so any already present are carried
+# forward rather than overwritten.
+$PortalTag = 'WindowsAzureActiveDirectoryIntegratedApp'
+$currentTags = @()
+if ($existingSp -and $existingSp.tags) { $currentTags = @($existingSp.tags) }
+
+if ($currentTags -notcontains $PortalTag) {
+    $ssoBody['tags'] = @($currentTags + $PortalTag)
+    Write-Host "Tagging as an enterprise application so it appears in the portal list..."
+}
+
 Invoke-GraphJson -Method PATCH `
     -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId" `
     -Body $ssoBody | Out-Null

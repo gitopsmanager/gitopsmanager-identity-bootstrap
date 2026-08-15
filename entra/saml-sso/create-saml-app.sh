@@ -193,12 +193,39 @@ else
 fi
 
 echo "Setting single sign-on mode to SAML..."
+
+# The Entra portal's "Enterprise applications" list defaults to filtering on
+# Application type = Enterprise Applications, which shows only service
+# principals carrying this tag. One created by the CLI has no tags, so it is
+# invisible there — the administrator sees the app registration and concludes
+# the enterprise application was never created. It was; the list is filtered.
+#
+# Tags are replaced wholesale by PATCH, so any already present are carried
+# forward rather than overwritten.
+PORTAL_TAG="WindowsAzureActiveDirectoryIntegratedApp"
+EXISTING_TAGS=$(az ad sp show --id "${SP_OBJECT_ID}" --query "join(',', not_null(tags, \`[]\`))" -o tsv)
+
+TAGS_FRAGMENT=""
+case ",${EXISTING_TAGS}," in
+  *",${PORTAL_TAG},"*)
+    : ;;   # already tagged, leave it alone
+  *)
+    if [ -n "${EXISTING_TAGS}" ]; then
+      ALL_TAGS="${EXISTING_TAGS},${PORTAL_TAG}"
+    else
+      ALL_TAGS="${PORTAL_TAG}"
+    fi
+    TAGS_FRAGMENT=", \"tags\": [\"$(echo "${ALL_TAGS}" | sed 's/,/","/g')\"]"
+    echo "Tagging as an enterprise application so it appears in the portal list..."
+    ;;
+esac
+
 # az ad sp update does not yet expose preferredSingleSignOnMode directly —
 # use the Graph API via az rest.
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}" \
   --headers "Content-Type=application/json" \
-  --body "{\"preferredSingleSignOnMode\": \"saml\", \"loginUrl\": \"${COGNITO_SIGN_ON_URL}\", \"appRoleAssignmentRequired\": false}"
+  --body "{\"preferredSingleSignOnMode\": \"saml\", \"loginUrl\": \"${COGNITO_SIGN_ON_URL}\", \"appRoleAssignmentRequired\": false${TAGS_FRAGMENT}}"
 echo "SAML SSO mode set."
 
 # ── STEP 3 — Token signing certificate ───────────────────────────────────────
