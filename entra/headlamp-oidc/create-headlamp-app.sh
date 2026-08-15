@@ -1,0 +1,564 @@
+#!/bin/bash
+# Copyright (c) 2026 GitOps Manager, S.L. All rights reserved.
+# =============================================================================
+# create-headlamp-app.sh
+#
+# Creates the two Entra applications Headlamp needs and puts their credentials
+# in whichever secret stores this installation uses:
+#
+#   headlamp                          the OIDC client that signs users in
+#   gitopsmanager-headlamp-patch-url  owns the above; patches its redirect URIs
+#
+# Talks to Entra, Key Vault and Secrets Manager directly. The server is told
+# only metadata -- application IDs and credential expiry dates -- so no customer
+# secret ever reaches the EKS Manager database.
+#
+# Safe to re-run. See "Secret resolution" below for why, and for the one case
+# where it deliberately refuses.
+# =============================================================================
+
+set -euo pipefail
+
+# --- Arguments ---------------------------------------------------------------
+KEY_VAULT_NAME=""
+ENABLE_AWS="false"
+HEADLAMP_APP_ID_OVERRIDE=""
+TRUST=""
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  create-headlamp-app.sh --key-vault <name>                # Azure
+  create-headlamp-app.sh --enable-aws                      # AWS
+  create-headlamp-app.sh --key-vault <name> --enable-aws   # both
+
+  --key-vault <name>    Store the credentials in this Key Vault.
+  --enable-aws          Store them in AWS Secrets Manager.
+
+  --headlamp-id <appId> Name the Headlamp application directly instead of
+                        searching by display name. Use when more than one
+                        application shares the name.
+  --trust azure|aws     Resolve a disagreement between the two stores that
+                        cannot be settled from credential hints.
+
+At least one store is required. The Entra work happens either way -- `az login`
+needs only a tenant, so an EKS-only installation does not need an Azure
+subscription.
+
+Everything else comes from the environment supplied by Settings -> Terraform
+tile -> Pipeline credentials.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --key-vault)
+      KEY_VAULT_NAME="${2:-}"
+      if [[ -z "$KEY_VAULT_NAME" ]]; then echo "ERROR: --key-vault needs a value." >&2; exit 1; fi
+      shift 2 ;;
+    --enable-aws) ENABLE_AWS="true"; shift ;;
+    --headlamp-id)
+      HEADLAMP_APP_ID_OVERRIDE="${2:-}"
+      if [[ -z "$HEADLAMP_APP_ID_OVERRIDE" ]]; then echo "ERROR: --headlamp-id needs a value." >&2; exit 1; fi
+      shift 2 ;;
+    --trust)
+      TRUST="${2:-}"
+      case "$TRUST" in azure|aws) ;; *) echo "ERROR: --trust must be azure or aws." >&2; exit 1 ;; esac
+      shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$KEY_VAULT_NAME" && "$ENABLE_AWS" != "true" ]]; then
+  echo "ERROR: nothing to do -- pass --key-vault, --enable-aws, or both." >&2
+  usage >&2
+  exit 1
+fi
+
+# --- Config ------------------------------------------------------------------
+APP_NAME="headlamp"
+PATCH_APP_NAME="gitopsmanager-headlamp-patch-url"
+
+KV_OIDC_NAME="global-headlamp-oidc"
+KV_PATCH_NAME="global-headlamp-patch-url"
+
+SM_OIDC_NAME="/EKSManagerBootstrap/headlamp-oidc"
+SM_PATCH_NAME="/EKSManagerBootstrap/headlamp-patch-url"
+
+K8S_SECRET_NAME="headlamp-oidc"
+K8S_NAMESPACE="headlamp"
+SECRET_YEARS_VALID=2
+
+# Fixed Microsoft identifier used as the access-token audience. Not tenant
+# specific and not a secret.
+VALIDATOR_CLIENT_ID="6dae42f8-4368-4678-94ff-3960e28e3630"
+
+PROBE_NAME="gitopsmanager-preflight-probe"
+
+# --- Helpers -----------------------------------------------------------------
+info()    { echo -e "\n\033[1;34m[INFO]\033[0m $*"; }
+success() { echo -e "\033[1;32m[OK]\033[0m $*"; }
+warn()    { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+error()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+
+# =============================================================================
+# PREFLIGHT
+#
+# All of this runs before anything is created. The ordering is the point, not
+# politeness: Entra reveals a client secret exactly once, so minting one and
+# then failing to store it leaves an application holding a credential nobody
+# has. That is the only unrecoverable failure here, and proving the writes
+# first avoids it entirely.
+# =============================================================================
+
+info "Preflight: Entra"
+TENANT_ID=$(az account show --query "tenantId" -o tsv 2>/dev/null || true)
+if [[ -z "$TENANT_ID" ]]; then
+  error "Not signed in to Azure. Run 'az login' first."
+fi
+az ad app list --top 1 --query "[0].appId" -o tsv >/dev/null 2>&1 \
+  || error "Cannot read applications in tenant $TENANT_ID. Check your directory role."
+success "Tenant $TENANT_ID, directory readable."
+
+# Create rights cannot be proven without creating something. Left to fail
+# clearly at the point of use.
+
+info "Preflight: EKS Manager API"
+for v in EKSMANAGER_API_URL EKSMANAGER_COGNITO_URL EKSMANAGER_CLIENT_ID EKSMANAGER_CLIENT_SECRET; do
+  if [[ -z "${!v:-}" ]]; then
+    error "$v is not set. Paste the credentials block from Settings -> Terraform tile."
+  fi
+done
+API_TOKEN=$(curl -fsSL -X POST "${EKSMANAGER_COGNITO_URL}/oauth2/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials&client_id=${EKSMANAGER_CLIENT_ID}&client_secret=${EKSMANAGER_CLIENT_SECRET}" \
+  2>/dev/null | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4 || true)
+if [[ -z "$API_TOKEN" ]]; then
+  error "Could not obtain an M2M token. Check the pipeline credentials and that this host is allowlisted."
+fi
+success "API reachable, token obtained."
+
+if [[ -n "$KEY_VAULT_NAME" ]]; then
+  info "Preflight: Key Vault '$KEY_VAULT_NAME'"
+  az keyvault show --name "$KEY_VAULT_NAME" --query "name" -o tsv >/dev/null 2>&1 \
+    || error "Key Vault '$KEY_VAULT_NAME' not found or not accessible."
+
+  # Prove write, do not assume it.
+  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$PROBE_NAME" \
+    --value "probe" --output none 2>/dev/null \
+    || error "Cannot write to Key Vault '$KEY_VAULT_NAME'. Grant Key Vault Secrets Officer and retry."
+  az keyvault secret delete --vault-name "$KEY_VAULT_NAME" --name "$PROBE_NAME" --output none 2>/dev/null || true
+  success "Key Vault writable."
+fi
+
+if [[ "$ENABLE_AWS" == "true" ]]; then
+  info "Preflight: AWS Secrets Manager"
+  AWS_ACCOUNT=$(aws sts get-caller-identity --query "Account" -o text 2>/dev/null || true)
+  if [[ -z "$AWS_ACCOUNT" ]]; then
+    error "No usable AWS credentials. Sign in, then retry."
+  fi
+  AWS_REGION_RESOLVED="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
+    AWS_REGION_RESOLVED=$(aws configure get region 2>/dev/null || true)
+  fi
+  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
+    error "No AWS region resolved. Set AWS_REGION and retry."
+  fi
+
+  # The ambient profile is convenient and is exactly how someone writes to the
+  # wrong account. Where the installation has told us what to expect, check it.
+  if [[ -n "${EKSMANAGER_AWS_ACCOUNT_ID:-}" && "$EKSMANAGER_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT" ]]; then
+    error "AWS session is account $AWS_ACCOUNT but this installation expects ${EKSMANAGER_AWS_ACCOUNT_ID}."
+  fi
+  if [[ -n "${EKSMANAGER_AWS_REGION:-}" && "$EKSMANAGER_AWS_REGION" != "$AWS_REGION_RESOLVED" ]]; then
+    error "AWS region is $AWS_REGION_RESOLVED but this installation expects ${EKSMANAGER_AWS_REGION}."
+  fi
+  if [[ -z "${EKSMANAGER_AWS_ACCOUNT_ID:-}" ]]; then
+    warn "Installation account not supplied in the environment -- writing to $AWS_ACCOUNT / $AWS_REGION_RESOLVED unchecked."
+  fi
+
+  # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.
+  aws secretsmanager create-secret --name "$PROBE_NAME" --secret-string "probe" \
+    --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
+    || aws secretsmanager put-secret-value --secret-id "$PROBE_NAME" --secret-string "probe" \
+         --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
+    || error "Cannot write to Secrets Manager in $AWS_ACCOUNT / $AWS_REGION_RESOLVED (check secretsmanager and kms permissions)."
+  aws secretsmanager delete-secret --secret-id "$PROBE_NAME" --force-delete-without-recovery \
+    --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 || true
+  success "Secrets Manager writable in $AWS_ACCOUNT / $AWS_REGION_RESOLVED."
+fi
+
+# =============================================================================
+# APPLICATIONS
+# =============================================================================
+
+# Entra does not enforce unique display names. Configuring the wrong application
+# -- disabling assignment-required on something unrelated, granting it a Graph
+# role -- is far worse than refusing, so ambiguity stops.
+resolve_app() {
+  local display_name="$1" override="$2" __out="$3"
+  local ids count
+
+  if [[ -n "$override" ]]; then
+    ids=$(az ad app list --filter "appId eq '$override'" --query "[].appId" -o tsv 2>/dev/null || true)
+    if [[ -z "$ids" ]]; then error "No application found with appId $override."; fi
+    printf -v "$__out" '%s' "$override"
+    return
+  fi
+
+  ids=$(az ad app list --display-name "$display_name" --query "[].appId" -o tsv 2>/dev/null || true)
+  count=$(printf '%s' "$ids" | grep -c . || true)
+
+  if [[ "$count" -gt 1 ]]; then
+    error "More than one application is named '$display_name':
+$(printf '%s' "$ids" | sed 's/^/         /')
+       Re-run with --headlamp-id <appId> naming the one you mean."
+  fi
+  printf -v "$__out" '%s' "$ids"
+}
+
+ensure_app() {
+  local display_name="$1" __out="$2" app_id="${3:-}"
+  if [[ -n "$app_id" ]]; then
+    warn "Application '$display_name' exists ($app_id). Reusing it."
+  else
+    info "Creating application '$display_name'..."
+    app_id=$(az ad app create --display-name "$display_name" --query "appId" -o tsv)
+    success "Created. App ID: $app_id"
+  fi
+  printf -v "$__out" '%s' "$app_id"
+}
+
+ensure_sp() {
+  local app_id="$1" __out="$2" sp_id
+  sp_id=$(az ad sp list --filter "appId eq '$app_id'" --query "[0].id" -o tsv 2>/dev/null || true)
+  if [[ -z "$sp_id" || "$sp_id" == "None" ]]; then
+    sp_id=$(az ad sp create --id "$app_id" --query "id" -o tsv)
+    success "Service principal created: $sp_id"
+  fi
+  printf -v "$__out" '%s' "$sp_id"
+}
+
+info "Resolving '$APP_NAME'"
+resolve_app "$APP_NAME" "$HEADLAMP_APP_ID_OVERRIDE" FOUND_ID
+ensure_app  "$APP_NAME" APP_ID "$FOUND_ID"
+ensure_sp   "$APP_ID" SP_OBJECT_ID
+APP_OBJECT_ID=$(az ad app show --id "$APP_ID" --query "id" -o tsv)
+
+# --- Sign-in configuration, each check-then-set ------------------------------
+info "Asserting sign-in configuration on '$APP_NAME'"
+
+if [[ "$(az ad sp show --id "$SP_OBJECT_ID" --query "appRoleAssignmentRequired" -o tsv 2>/dev/null || echo true)" != "false" ]]; then
+  az ad sp update --id "$SP_OBJECT_ID" --set "appRoleAssignmentRequired=false"
+  success "Assignment required disabled."
+fi
+
+if [[ "$(az rest --method GET --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID" \
+        --query "api.requestedAccessTokenVersion" -o tsv 2>/dev/null || true)" != "2" ]]; then
+  az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID" \
+    --body '{"api": {"requestedAccessTokenVersion": 2}}'
+  success "Access token version set to v2.0."
+fi
+
+if [[ "$(az rest --method GET --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID" \
+        --query "groupMembershipClaims" -o tsv 2>/dev/null || true)" != "SecurityGroup" ]]; then
+  az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID" \
+    --body '{"groupMembershipClaims": "SecurityGroup"}'
+  success "groupMembershipClaims set to SecurityGroup."
+fi
+
+# --- The patcher -------------------------------------------------------------
+# Separate from the Headlamp application deliberately. Adding a redirect URI IS
+# the sensitive operation -- a callback pointing at someone else's
+# infrastructure harvests authorization codes for every user who signs in. If
+# Headlamp owned itself, one leaked secret would buy both.
+info "Resolving '$PATCH_APP_NAME'"
+resolve_app "$PATCH_APP_NAME" "" FOUND_PATCH
+ensure_app  "$PATCH_APP_NAME" PATCH_APP_ID "$FOUND_PATCH"
+ensure_sp   "$PATCH_APP_ID" PATCH_SP_ID
+
+if [[ -z "$(az ad app owner list --id "$APP_ID" --query "[?id=='$PATCH_SP_ID'].id" -o tsv 2>/dev/null || true)" ]]; then
+  az ad app owner add --id "$APP_ID" --owner-object-id "$PATCH_SP_ID"
+  success "'$PATCH_APP_NAME' added as owner of '$APP_NAME'."
+fi
+
+# Application.ReadWrite.OwnedBy is the narrowest permission Graph offers -- there
+# is no scope for "manage redirect URIs only". It confines the caller to
+# applications it owns, plus any it creates.
+GRAPH_SP=$(az ad sp show --id 00000003-0000-0000-c000-000000000000 --query "id" -o tsv)
+OWNED_BY_ROLE_ID=$(az ad sp show --id 00000003-0000-0000-c000-000000000000 \
+  --query "appRoles[?value=='Application.ReadWrite.OwnedBy'].id" -o tsv)
+
+if [[ -z "$(az rest --method GET \
+      --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PATCH_SP_ID/appRoleAssignments" \
+      --query "value[?appRoleId=='$OWNED_BY_ROLE_ID'].id" -o tsv 2>/dev/null || true)" ]]; then
+  az rest --method POST \
+    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PATCH_SP_ID/appRoleAssignments" \
+    --body "{\"principalId\":\"$PATCH_SP_ID\",\"resourceId\":\"$GRAPH_SP\",\"appRoleId\":\"$OWNED_BY_ROLE_ID\"}"
+  success "Application.ReadWrite.OwnedBy granted."
+fi
+
+# =============================================================================
+# SECRET RESOLUTION
+#
+#   1. Key Vault, if enabled and present
+#   2. Secrets Manager, if enabled and present
+#   3. Mint -- only if the application has no credentials at all
+#   4. Otherwise stop
+#
+# Steps 1 and 2 do double duty: they make re-runs safe, and they copy an
+# existing value from one cloud to the other.
+# =============================================================================
+
+kv_get()  { az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$1" --query "value" -o tsv 2>/dev/null || true; }
+sm_get()  { aws secretsmanager get-secret-value --secret-id "$1" --region "$AWS_REGION_RESOLVED" --query "SecretString" --output text 2>/dev/null || true; }
+
+json_field() { printf '%s' "$1" | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin).get('$2',''))
+except Exception: pass
+"; }
+
+manifest_secret() { printf '%s' "$1" | python3 -c "
+import base64,json,sys
+try: print(base64.b64decode(json.load(sys.stdin)['data']['clientSecret']).decode())
+except Exception: pass
+"; }
+
+# Entra returns a hint -- the first characters -- for every credential on an
+# application. The values themselves are never returned, but the hint is enough
+# to tell a live credential from a stale stored copy.
+secret_is_live() {
+  local app_id="$1" value="$2"
+  [[ -z "$value" ]] && return 1
+  az ad app credential list --id "$app_id" --query "[].hint" -o tsv 2>/dev/null \
+    | grep -qx "${value:0:3}"
+}
+
+# Resolves one application's secret across both stores. Sets RESOLVED_SECRET and
+# RESOLVED_ORIGIN.
+resolve_secret() {
+  local app_id="$1" label="$2" azure_value="$3" aws_value="$4"
+  RESOLVED_SECRET=""; RESOLVED_ORIGIN=""
+
+  if [[ -n "$azure_value" && -n "$aws_value" && "$azure_value" != "$aws_value" ]]; then
+    local az_live="no" aws_live="no"
+    secret_is_live "$app_id" "$azure_value" && az_live="yes"
+    secret_is_live "$app_id" "$aws_value"   && aws_live="yes"
+
+    if [[ "$az_live" == "yes" && "$aws_live" == "no" ]]; then
+      warn "$label: the Secrets Manager copy is no longer a live credential. Using Key Vault."
+      RESOLVED_SECRET="$azure_value"; RESOLVED_ORIGIN="key vault"; return
+    fi
+    if [[ "$aws_live" == "yes" && "$az_live" == "no" ]]; then
+      warn "$label: the Key Vault copy is no longer a live credential. Using Secrets Manager."
+      RESOLVED_SECRET="$aws_value"; RESOLVED_ORIGIN="secrets manager"; return
+    fi
+    if [[ "$az_live" == "no" && "$aws_live" == "no" ]]; then
+      error "$label: neither stored secret matches a live credential on the application.
+       Both are stale. This needs a deliberate rotation."
+    fi
+
+    # Both live. Someone added a secret without updating both sides; nothing is
+    # broken, but only the operator can say which should win.
+    case "$TRUST" in
+      azure) RESOLVED_SECRET="$azure_value"; RESOLVED_ORIGIN="key vault (--trust azure)" ;;
+      aws)   RESOLVED_SECRET="$aws_value";   RESOLVED_ORIGIN="secrets manager (--trust aws)" ;;
+      *) error "$label: Key Vault and Secrets Manager hold different secrets and both are live.
+       Re-run with --trust azure or --trust aws, then remove the losing
+       credential from the application so this does not recur." ;;
+    esac
+    return
+  fi
+
+  if [[ -n "$azure_value" ]]; then RESOLVED_SECRET="$azure_value"; RESOLVED_ORIGIN="key vault"; return; fi
+  if [[ -n "$aws_value"   ]]; then RESOLVED_SECRET="$aws_value";   RESOLVED_ORIGIN="secrets manager"; return; fi
+
+  local cred_count
+  cred_count=$(az ad app credential list --id "$app_id" --query "length(@)" -o tsv 2>/dev/null || echo 0)
+  if [[ "${cred_count:-0}" -gt 0 ]]; then
+    error "$label already has ${cred_count} client secret(s), and Entra does not return one
+       after creation. No enabled store holds it, so it cannot be recovered.
+
+       Re-run including the store that does hold it, or rotate deliberately --
+       a rotation invalidates the credential every running Headlamp is using
+       and needs every cluster refreshed."
+  fi
+
+  info "Minting a client secret for $label (valid ${SECRET_YEARS_VALID} years)..."
+  local end_date
+  end_date=$(date -u -d "+${SECRET_YEARS_VALID} years" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -v+${SECRET_YEARS_VALID}y '+%Y-%m-%dT%H:%M:%SZ')
+  RESOLVED_SECRET=$(az ad app credential reset --id "$app_id" \
+    --display-name "$label" --end-date "$end_date" --query "password" -o tsv)
+  RESOLVED_ORIGIN="minted"
+  success "Created."
+}
+
+info "Resolving credentials"
+
+KV_OIDC_DOC="";  KV_PATCH_DOC=""
+SM_OIDC_DOC="";  SM_PATCH_DOC=""
+if [[ -n "$KEY_VAULT_NAME" ]]; then KV_OIDC_DOC=$(kv_get "$KV_OIDC_NAME"); KV_PATCH_DOC=$(kv_get "$KV_PATCH_NAME"); fi
+if [[ "$ENABLE_AWS" == "true" ]]; then SM_OIDC_DOC=$(sm_get "$SM_OIDC_NAME"); SM_PATCH_DOC=$(sm_get "$SM_PATCH_NAME"); fi
+
+resolve_secret "$APP_ID" "$APP_NAME" \
+  "$( [[ -n "$KV_OIDC_DOC" ]] && manifest_secret "$KV_OIDC_DOC" )" \
+  "$( [[ -n "$SM_OIDC_DOC" ]] && manifest_secret "$SM_OIDC_DOC" )"
+HEADLAMP_SECRET="$RESOLVED_SECRET"; HEADLAMP_ORIGIN="$RESOLVED_ORIGIN"
+
+resolve_secret "$PATCH_APP_ID" "$PATCH_APP_NAME" \
+  "$( [[ -n "$KV_PATCH_DOC" ]] && json_field "$KV_PATCH_DOC" clientSecret )" \
+  "$( [[ -n "$SM_PATCH_DOC" ]] && json_field "$SM_PATCH_DOC" clientSecret )"
+PATCH_SECRET="$RESOLVED_SECRET"; PATCH_ORIGIN="$RESOLVED_ORIGIN"
+
+# =============================================================================
+# WRITE TO STORES
+# =============================================================================
+
+# All seven keys are always present, even when empty. The deployment reads them
+# with secretKeyRef and no `optional: true`, so a missing key does not fall back
+# to a default -- the pod fails with CreateContainerConfigError.
+build_manifest() {
+  local use_access_token="$1"
+  APP_ID="$APP_ID" HEADLAMP_SECRET="$HEADLAMP_SECRET" TENANT_ID="$TENANT_ID" \
+  K8S_SECRET_NAME="$K8S_SECRET_NAME" K8S_NAMESPACE="$K8S_NAMESPACE" \
+  VALIDATOR_CLIENT_ID="$VALIDATOR_CLIENT_ID" USE_ACCESS_TOKEN="$use_access_token" python3 -c "
+import base64, json, os
+def b64(s): return base64.b64encode(s.encode()).decode()
+uat = os.environ['USE_ACCESS_TOKEN']
+azure = uat == 'true'
+tenant = os.environ['TENANT_ID']
+print(json.dumps({
+  'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
+  'metadata': {'name': os.environ['K8S_SECRET_NAME'], 'namespace': os.environ['K8S_NAMESPACE']},
+  'data': {
+    'clientID':           b64(os.environ['APP_ID']),
+    'clientSecret':       b64(os.environ['HEADLAMP_SECRET']),
+    'issuerURL':          b64('https://login.microsoftonline.com/%s/v2.0' % tenant),
+    'scopes':             b64('%s/user.read,openid,email,profile' % os.environ['VALIDATOR_CLIENT_ID'] if azure else 'openid,email,profile'),
+    'validatorClientID':  b64(os.environ['VALIDATOR_CLIENT_ID'] if azure else ''),
+    'validatorIssuerURL': b64('https://sts.windows.net/%s/' % tenant if azure else ''),
+    'useAccessToken':     b64(uat),
+  },
+}))
+"
+}
+
+build_patch_doc() {
+  PATCH_APP_ID="$PATCH_APP_ID" PATCH_SECRET="$PATCH_SECRET" TENANT_ID="$TENANT_ID" python3 -c "
+import json, os
+print(json.dumps({
+  'clientId':     os.environ['PATCH_APP_ID'],
+  'clientSecret': os.environ['PATCH_SECRET'],
+  'tenantId':     os.environ['TENANT_ID'],
+}))
+"
+}
+
+STORES_WRITTEN=""
+
+if [[ -n "$KEY_VAULT_NAME" ]]; then
+  info "Key Vault"
+  WANT_OIDC=$(build_manifest true)
+  WANT_PATCH=$(build_patch_doc)
+  if [[ "$WANT_OIDC" != "$KV_OIDC_DOC" ]]; then
+    az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$KV_OIDC_NAME" --value "$WANT_OIDC" --output none
+    success "$KV_OIDC_NAME written."
+  else
+    success "$KV_OIDC_NAME already current."
+  fi
+  if [[ "$WANT_PATCH" != "$KV_PATCH_DOC" ]]; then
+    az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$KV_PATCH_NAME" --value "$WANT_PATCH" --output none
+    success "$KV_PATCH_NAME written."
+  else
+    success "$KV_PATCH_NAME already current."
+  fi
+  STORES_WRITTEN="azure"
+fi
+
+if [[ "$ENABLE_AWS" == "true" ]]; then
+  info "Secrets Manager"
+  # useAccessToken is false on AWS: the EKS API server requires an aud claim
+  # that Entra access tokens do not carry in the form it expects. The ID token
+  # does, which makes the validator pair unnecessary -- but the keys stay.
+  WANT_OIDC=$(build_manifest false)
+  WANT_PATCH=$(build_patch_doc)
+  sm_put() {
+    local name="$1" value="$2"
+    aws secretsmanager put-secret-value --secret-id "$name" --secret-string "$value" \
+      --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
+      || aws secretsmanager create-secret --name "$name" --secret-string "$value" \
+           --region "$AWS_REGION_RESOLVED" >/dev/null
+  }
+  if [[ "$WANT_OIDC" != "$SM_OIDC_DOC" ]]; then
+    sm_put "$SM_OIDC_NAME" "$WANT_OIDC";  success "$SM_OIDC_NAME written."
+  else
+    success "$SM_OIDC_NAME already current."
+  fi
+  if [[ "$WANT_PATCH" != "$SM_PATCH_DOC" ]]; then
+    sm_put "$SM_PATCH_NAME" "$WANT_PATCH"; success "$SM_PATCH_NAME written."
+  else
+    success "$SM_PATCH_NAME already current."
+  fi
+  STORES_WRITTEN="${STORES_WRITTEN:+$STORES_WRITTEN,}aws"
+fi
+
+# =============================================================================
+# REPORT METADATA
+#
+# No secrets. Application IDs and expiry dates only -- enough for the credential
+# dashboard, and nothing that would matter if it were logged. Entra sends no
+# notification before an application client secret expires, so these dates are
+# the only warning that will exist.
+# =============================================================================
+
+info "Reporting to EKS Manager"
+
+app_expiry() { az ad app credential list --id "$1" --query "[0].endDateTime" -o tsv 2>/dev/null || true; }
+
+PAYLOAD=$(APP_ID="$APP_ID" PATCH_APP_ID="$PATCH_APP_ID" TENANT_ID="$TENANT_ID" \
+  HEADLAMP_EXPIRY="$(app_expiry "$APP_ID")" PATCH_EXPIRY="$(app_expiry "$PATCH_APP_ID")" \
+  STORES_WRITTEN="$STORES_WRITTEN" python3 -c "
+import json, os
+print(json.dumps({
+  'headlampAppId':        os.environ['APP_ID'],
+  'patchUrlAppId':        os.environ['PATCH_APP_ID'],
+  'tenantId':             os.environ['TENANT_ID'],
+  'issuerURL':            'https://login.microsoftonline.com/%s/v2.0' % os.environ['TENANT_ID'],
+  'headlampSecretExpiry': os.environ['HEADLAMP_EXPIRY'],
+  'patchUrlSecretExpiry': os.environ['PATCH_EXPIRY'],
+  'storesWritten':        os.environ['STORES_WRITTEN'],
+}))
+")
+
+HTTP_STATUS=$(curl -sS -o /tmp/headlamp-status-response.json -w '%{http_code}' \
+  -X POST "${EKSMANAGER_API_URL}/config/headlamp/status" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "$PAYLOAD" || echo "000")
+
+case "$HTTP_STATUS" in
+  2*) success "Reported (HTTP $HTTP_STATUS)." ;;
+  *)  warn "Could not report to EKS Manager (HTTP $HTTP_STATUS). The applications and secrets are in place;
+       only the dashboard metadata is missing. Re-run to retry."
+      sed -n '1,20p' /tmp/headlamp-status-response.json >&2 2>/dev/null || true ;;
+esac
+rm -f /tmp/headlamp-status-response.json
+
+# --- Summary -----------------------------------------------------------------
+echo ""
+echo "============================================================"
+echo " Headlamp identity ready"
+echo "============================================================"
+echo " Tenant:        $TENANT_ID"
+echo " $APP_NAME"
+echo "   App ID:      $APP_ID"
+echo "   Secret:      $HEADLAMP_ORIGIN"
+echo " $PATCH_APP_NAME"
+echo "   App ID:      $PATCH_APP_ID"
+echo "   Secret:      $PATCH_ORIGIN"
+echo "   Owns:        $APP_NAME (Application.ReadWrite.OwnedBy)"
+echo " Stores:        ${STORES_WRITTEN:-none}"
+echo "============================================================"
