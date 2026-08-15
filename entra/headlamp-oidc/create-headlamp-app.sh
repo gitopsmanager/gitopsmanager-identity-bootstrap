@@ -94,7 +94,13 @@ SECRET_YEARS_VALID=2
 # specific and not a secret.
 VALIDATOR_CLIENT_ID="6dae42f8-4368-4678-94ff-3960e28e3630"
 
-PROBE_NAME="gitopsmanager-preflight-probe"
+# Two names, because the stores disagree about what a name may contain and
+# because the AWS one has to sit where a scoped policy can see it. A probe
+# outside /EKSManagerBootstrap/headlamp-* would fail preflight on an operator
+# whose permissions are correct -- reporting a write problem that is really a
+# naming one.
+KV_PROBE_NAME="gitopsmanager-preflight-probe"
+SM_PROBE_NAME="/EKSManagerBootstrap/headlamp-preflight-probe"
 
 # --- Helpers -----------------------------------------------------------------
 info()    { echo -e "\n\033[1;34m[INFO]\033[0m $*"; }
@@ -145,10 +151,10 @@ if [[ -n "$KEY_VAULT_NAME" ]]; then
     || error "Key Vault '$KEY_VAULT_NAME' not found or not accessible."
 
   # Prove write, do not assume it.
-  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$PROBE_NAME" \
+  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$KV_PROBE_NAME" \
     --value "probe" --output none 2>/dev/null \
     || error "Cannot write to Key Vault '$KEY_VAULT_NAME'. Grant Key Vault Secrets Officer and retry."
-  az keyvault secret delete --vault-name "$KEY_VAULT_NAME" --name "$PROBE_NAME" --output none 2>/dev/null || true
+  az keyvault secret delete --vault-name "$KEY_VAULT_NAME" --name "$KV_PROBE_NAME" --output none 2>/dev/null || true
   success "Key Vault writable."
 fi
 
@@ -166,25 +172,38 @@ if [[ "$ENABLE_AWS" == "true" ]]; then
     error "No AWS region resolved. Set AWS_REGION and retry."
   fi
 
-  # The ambient profile is convenient and is exactly how someone writes to the
-  # wrong account. Where the installation has told us what to expect, check it.
+  # This writes to Secrets Manager and uses EKSManagerCMK, both of which live in
+  # the SHARED SERVICES account. Nothing is assumed to get there -- so the
+  # session has to be the right one to begin with, and the only thing standing
+  # between a wrong session and a secret written to the wrong account is this
+  # check.
   if [[ -n "${EKSMANAGER_AWS_ACCOUNT_ID:-}" && "$EKSMANAGER_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT" ]]; then
-    error "AWS session is account $AWS_ACCOUNT but this installation expects ${EKSMANAGER_AWS_ACCOUNT_ID}."
+    error "Wrong AWS account.
+
+       Signed in to : $AWS_ACCOUNT
+       Expected     : ${EKSMANAGER_AWS_ACCOUNT_ID}  (shared services)
+
+       Sign in with credentials for the shared services account and re-run.
+       This script does not assume a role to get there.
+
+       Worth knowing: setup-pipeline.sh runs from the MANAGEMENT account. This
+       one does not, which is an easy thing to carry over out of habit."
   fi
   if [[ -n "${EKSMANAGER_AWS_REGION:-}" && "$EKSMANAGER_AWS_REGION" != "$AWS_REGION_RESOLVED" ]]; then
     error "AWS region is $AWS_REGION_RESOLVED but this installation expects ${EKSMANAGER_AWS_REGION}."
   fi
   if [[ -z "${EKSMANAGER_AWS_ACCOUNT_ID:-}" ]]; then
-    warn "Installation account not supplied in the environment -- writing to $AWS_ACCOUNT / $AWS_REGION_RESOLVED unchecked."
+    warn "The expected account was not supplied in the environment, so this session cannot be checked."
+    warn "About to write to $AWS_ACCOUNT / $AWS_REGION_RESOLVED -- confirm that is your shared services account."
   fi
 
   # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.
-  aws secretsmanager create-secret --name "$PROBE_NAME" --secret-string "probe" \
+  aws secretsmanager create-secret --name "$SM_PROBE_NAME" --secret-string "probe" \
     --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
-    || aws secretsmanager put-secret-value --secret-id "$PROBE_NAME" --secret-string "probe" \
+    || aws secretsmanager put-secret-value --secret-id "$SM_PROBE_NAME" --secret-string "probe" \
          --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
     || error "Cannot write to Secrets Manager in $AWS_ACCOUNT / $AWS_REGION_RESOLVED (check secretsmanager and kms permissions)."
-  aws secretsmanager delete-secret --secret-id "$PROBE_NAME" --force-delete-without-recovery \
+  aws secretsmanager delete-secret --secret-id "$SM_PROBE_NAME" --force-delete-without-recovery \
     --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 || true
   success "Secrets Manager writable in $AWS_ACCOUNT / $AWS_REGION_RESOLVED."
 fi

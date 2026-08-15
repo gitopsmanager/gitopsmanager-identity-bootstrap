@@ -3,12 +3,72 @@
 Creates the Entra applications Headlamp needs and puts their credentials in
 whichever secret stores your installation uses.
 
+## Which script
+
+Two versions, aimed at two customer shapes rather than at two preferences:
+
+| Customer | Script | Stores |
+|---|---|---|
+| AWS + Microsoft 365, no Azure subscription | `.sh` on Linux — python3 already present | Secrets Manager only |
+| Azure or hybrid, has a subscription | `.ps1` — no python3, no curl | Key Vault, or both |
+
+The first is more common than it sounds. Buying Microsoft 365 creates an Entra
+tenant; it does not create an Azure subscription. An organisation running its
+workloads on AWS and its email on Microsoft has a directory to authenticate
+against and no Azure resources at all — so there is no Key Vault to write to,
+and everything lands in Secrets Manager.
+
+## Prerequisites
+
+**Azure CLI** — required either way. It performs every directory operation, and
+it is the only Microsoft component needed: no subscription, no portal visit, no
+Windows machine.
+
+```bash
+# Ubuntu / Debian
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+```
+
+```powershell
+# Windows
+winget install -e --id Microsoft.AzureCLI
+# or the MSI: https://aka.ms/installazurecliwindows
+```
+
+**AWS CLI** — only when writing to Secrets Manager.
+
+**python3 and curl** — only for the `.sh` version, and both are already present
+on a standard Ubuntu install. The `.ps1` needs neither.
+
+### Signing in
+
+```bash
+az login
+az login --allow-no-subscriptions              # tenant with no subscription
+az login --use-device-code                     # headless box, no browser
+```
+
+Combine the last two on a headless server in a tenant with no subscription.
+Without `--allow-no-subscriptions` the CLI reports what looks like a login
+failure, and it is easy to conclude the product needs an Azure subscription —
+it does not. App registrations are directory objects, not Azure resources.
+
+You also need rights to create app registrations and service principals
+(Cloud Application Administrator or higher), and write access to whichever
+stores you enable.
+
 ## Usage
 
 ```bash
 ./create-headlamp-app.sh --key-vault <name>                # Azure
 ./create-headlamp-app.sh --enable-aws                      # AWS
 ./create-headlamp-app.sh --key-vault <name> --enable-aws   # both
+```
+
+```powershell
+.\create-headlamp-app.ps1 -KeyVault <name>                 # Azure
+.\create-headlamp-app.ps1 -EnableAws                       # AWS
+.\create-headlamp-app.ps1 -KeyVault <name> -EnableAws      # both
 ```
 
 At least one store is required. The Entra work happens either way — it is the
@@ -26,9 +86,6 @@ through:
 Everything else — AWS account and region, Azure tenant — comes from the
 environment. Paste the block from **Settings → Terraform tile → Pipeline
 credentials** before running.
-
-You also need to be signed in with rights to create app registrations and
-service principals, and to write to whichever stores you enable.
 
 ## Two applications
 
