@@ -305,20 +305,49 @@ Write-Host "SAML SSO mode set."
 Write-Host ""
 Write-Host "Step 3/5 -- Checking for existing token signing certificate..."
 
-# A service principal created moments ago has no tokenSigningCertificates
-# collection at all, and Graph answers 404 rather than an empty list. That is the
-# normal first-run path, so a non-zero exit here means "none yet", not a failure.
-$certsResult = Invoke-Az @(
-    'rest', '--method', 'GET',
-    '--uri', "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/tokenSigningCertificates"
-)
-$existingCerts = if ($certsResult.ExitCode -eq 0 -and $certsResult.Output) {
-    $certsResult.Output | ConvertFrom-Json
-} else { $null }
+# Signing certificates live in the service principal's keyCredentials. There is
+# NO /tokenSigningCertificates navigation property to GET -- asking for one
+# returns "Resource 'tokenSigningCertificates' does not exist", every time,
+# certificate or not. An earlier version of this script read that 404 as "none
+# yet" and so minted a brand new certificate on every single run.
+#
+# Each certificate appears as two entries: usage "Verify" (the public half,
+# which is the only one Graph returns a key for) and usage "Sign".
+$spUri = 'https://graph.microsoft.com/v1.0/servicePrincipals/{0}?$select=keyCredentials,preferredTokenSigningKeyThumbprint' -f $SpObjectId
+$spResult = Invoke-Az @('rest', '--method', 'GET', '--uri', $spUri)
+if ($spResult.ExitCode -ne 0) {
+    Write-Error "ERROR: could not read the service principal's certificates -- az reported the reason above."
+    exit 1
+}
+$spInfo = $spResult.Output | ConvertFrom-Json
 
-if ($existingCerts.value -and $existingCerts.value.Count -gt 0) {
-    Write-Host "Token signing certificate already exists. Thumbprint: $($existingCerts.value[0].thumbprint)"
-    $CertValue = $existingCerts.value[0].key
+$nowUtc = (Get-Date).ToUniversalTime()
+$existingCerts = @($spInfo.keyCredentials | Where-Object {
+    $_.usage -eq 'Verify' -and
+    $_.type  -eq 'AsymmetricX509Cert' -and
+    $_.key -and
+    ([datetime]$_.endDateTime).ToUniversalTime() -gt $nowUtc
+})
+
+if ($existingCerts.Count -gt 0) {
+    $activeCert = $existingCerts |
+        Sort-Object { [datetime]$_.endDateTime } -Descending |
+        Select-Object -First 1
+
+    Write-Host "Reusing existing signing certificate. Expires: $($activeCert.endDateTime)"
+    $CertValue = $activeCert.key
+
+    if ($existingCerts.Count -gt 1) {
+        Write-Host ""
+        Write-Host "NOTE: this application has $($existingCerts.Count) valid signing certificates."
+        Write-Host "      Earlier versions of this script added one per run. Only one should be"
+        Write-Host "      active -- remove the rest under Entra > Enterprise applications >"
+        Write-Host "      '$AppName' > Single sign-on > SAML Certificates."
+        if (-not $spInfo.preferredTokenSigningKeyThumbprint) {
+            Write-Host "      No active certificate is designated, so which one signs is undefined."
+        }
+        Write-Host ""
+    }
 } else {
     Write-Host "Creating self-signed token signing certificate..."
     $expiry = (Get-Date).AddYears(3).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -334,6 +363,16 @@ if ($existingCerts.value -and $existingCerts.value.Count -gt 0) {
         Write-Error "ERROR: the certificate call returned no key -- nothing to report to GitOps Manager."
         exit 1
     }
+
+    # Name it the active signing key. Without this the tenant leaves the choice
+    # undefined, and the certificate reported to GitOps Manager may not be the
+    # one Entra actually signs assertions with.
+    if ($certResult.thumbprint) {
+        Invoke-GraphJson -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId" `
+            -Body @{ preferredTokenSigningKeyThumbprint = $certResult.thumbprint } | Out-Null
+    }
+
     Write-Host "Certificate created."
 }
 

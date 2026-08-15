@@ -206,15 +206,37 @@ echo "SAML SSO mode set."
 echo ""
 echo "Step 3/5 — Checking for existing token signing certificate..."
 
-EXISTING_CERT=$(az rest --method GET \
-  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}/tokenSigningCertificates" \
-  --query "value[0].thumbprint" -o tsv 2>/dev/null || echo "")
+# Signing certificates live in the service principal's keyCredentials. There is
+# NO /tokenSigningCertificates navigation property to GET — asking for one
+# returns "Resource 'tokenSigningCertificates' does not exist", every time,
+# certificate or not. An earlier version of this script read that 404 as "none
+# yet" and so minted a brand new certificate on every single run.
+#
+# Each certificate appears as two entries: usage "Verify" (the public half,
+# which is the only one Graph returns a key for) and usage "Sign".
+NOW_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-if [ -n "${EXISTING_CERT}" ] && [ "${EXISTING_CERT}" != "null" ]; then
-  echo "Token signing certificate already exists. Thumbprint: ${EXISTING_CERT}"
-  CERT_VALUE=$(az rest --method GET \
-    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}/tokenSigningCertificates" \
-    --query "value[0].key" -o tsv)
+CERT_VALUE=$(az rest --method GET \
+  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}?\$select=keyCredentials" \
+  --query "reverse(sort_by(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${NOW_UTC}'], &endDateTime))[0].key" \
+  -o tsv)
+
+if [ -n "${CERT_VALUE}" ] && [ "${CERT_VALUE}" != "null" ]; then
+  echo "Reusing existing signing certificate."
+
+  CERT_COUNT=$(az rest --method GET \
+    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}?\$select=keyCredentials" \
+    --query "length(keyCredentials[?usage=='Verify' && type=='AsymmetricX509Cert' && key!=null && endDateTime > '${NOW_UTC}'])" \
+    -o tsv)
+
+  if [ "${CERT_COUNT}" -gt 1 ] 2>/dev/null; then
+    echo ""
+    echo "NOTE: this application has ${CERT_COUNT} valid signing certificates."
+    echo "      Earlier versions of this script added one per run. Only one should be"
+    echo "      active — remove the rest under Entra > Enterprise applications >"
+    echo "      '${APP_NAME}' > Single sign-on > SAML Certificates."
+    echo ""
+  fi
 else
   echo "Creating self-signed token signing certificate..."
   CERT_JSON=$(az rest --method POST \
@@ -222,7 +244,24 @@ else
     --headers "Content-Type=application/json" \
     --body "{\"displayName\": \"CN=EKS Manager SAML Signing\", \"endDateTime\": \"$(date -u -d '+3 years' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v+3y '+%Y-%m-%dT%H:%M:%SZ')\"}")
   CERT_VALUE=$(echo "${CERT_JSON}" | grep -o '"key": *"[^"]*"' | cut -d'"' -f4)
+
+  # Name it the active signing key. Without this the tenant leaves the choice
+  # undefined, and the certificate reported to GitOps Manager may not be the one
+  # Entra actually signs assertions with.
+  CERT_THUMBPRINT=$(echo "${CERT_JSON}" | grep -o '"thumbprint": *"[^"]*"' | cut -d'"' -f4)
+  if [ -n "${CERT_THUMBPRINT}" ]; then
+    az rest --method PATCH \
+      --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${SP_OBJECT_ID}" \
+      --headers "Content-Type=application/json" \
+      --body "{\"preferredTokenSigningKeyThumbprint\": \"${CERT_THUMBPRINT}\"}" >/dev/null
+  fi
+
   echo "Certificate created."
+fi
+
+if [ -z "${CERT_VALUE}" ] || [ "${CERT_VALUE}" = "null" ]; then
+  echo "ERROR: no signing certificate key available — nothing to report to GitOps Manager." >&2
+  exit 1
 fi
 
 # ── STEP 4 — Get M2M bearer token ────────────────────────────────────────────
