@@ -190,8 +190,15 @@ stores were written. No credential ever reaches the EKS Manager database.
 
 The expiry dates matter more than they look: **Entra sends no notification
 before an application client secret expires** — that warning exists only for
-SAML signing certificates. These dates are the only warning you will get, and
-they feed the credential view in the dashboard.
+SAML signing certificates, and even that one is unreliable for applications
+registered in your own tenant (see the root README). These dates are the only
+warning you will get.
+
+They feed the credential view in Settings, which from **30 days before expiry**
+shows the days remaining and raises a warning when the page loads, escalating
+to an error once the date has passed. That view is live for the SAML signing
+certificate today; the same warning for these two client secrets is being built
+on the dates this script already reports.
 
 If the report fails the script says so and continues. The applications and
 secrets are already in place; only the dashboard metadata is missing, and
@@ -202,6 +209,10 @@ re-running retries it.
 Both secrets are valid for two years. When the Headlamp secret lapses, sign-in
 fails on every cluster at once. When the patcher's lapses, new clusters get no
 callback registered and their Headlamp cannot be signed into at all.
+
+Neither failure gives any advance sign, and nothing in Entra will tell you.
+Settings warns from 30 days out — treat that as the only notice you will
+receive, and rotate by re-running this script when it appears.
 
 ## What happens after this
 

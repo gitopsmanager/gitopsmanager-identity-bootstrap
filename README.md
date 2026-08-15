@@ -30,9 +30,15 @@ in alongside. Microsoft Entra ID is the only one supported today.
 
 | Application | Signs in | Credential | Expiry warning |
 |---|---|---|---|
-| SAML SSO | users, to the GitOps Manager dashboard | signing certificate | Entra emails at 60/30/7 days |
-| `headlamp` | users, to Headlamp | client secret | **none** |
-| `gitopsmanager-headlamp-patch-url` | nobody — it registers redirect URIs | client secret | **none** |
+| SAML SSO | users, to the GitOps Manager dashboard | signing certificate | **GitOps Manager, from 30 days out** |
+| `headlamp` | users, to Headlamp | client secret | GitOps Manager, from 30 days out — *planned* |
+| `gitopsmanager-headlamp-patch-url` | nobody — it registers redirect URIs | client secret | GitOps Manager, from 30 days out — *planned* |
+
+From 30 days before expiry, **Settings** shows the remaining days against the
+credential and raises a warning on page load, escalating to an error once the
+date has passed. The SAML signing certificate is live today; the two Headlamp
+client secrets report their expiry dates already and the warning for them is
+being built on the same mechanism.
 
 Sign-in to the dashboard reaches your directory through Cognito; Headlamp
 reaches it directly, because the Kubernetes API server has to validate the same
@@ -40,20 +46,45 @@ token and only accepts certain issuers. Two paths, one directory.
 
 ## Credential expiry — read this before relying on either
 
-**The SAML signing certificate is the only credential your identity provider
-will warn you about**, and only if notification addresses are configured on the
-application. Microsoft documents that when those are set programmatically, an
-administrator must open the application's single sign-on blade in the portal
-once before notifications actually fire — so confirm in the portal rather than
-assuming.
+**Treat GitOps Manager as the only warning you will get.** Everything below is
+why.
 
-**Application client secrets get no notification at all.** Entra emails about
-SAML certificates and nothing else. When the Headlamp secret lapses, sign-in
-fails on every cluster simultaneously, with no warning and no recent change to
-point at. When the patcher's lapses, new clusters get no callback registered.
+**Application client secrets get no notification from Entra at all.** It emails
+about SAML signing certificates and nothing else. When the Headlamp secret
+lapses, sign-in fails on every cluster simultaneously, with no warning and no
+recent change to point at. When the patcher's lapses, new clusters get no
+callback registered.
 
-Both scripts report expiry dates back to EKS Manager for exactly this reason.
-That view is the only warning that will exist.
+**Do not count on the SAML certificate email either.** It requires notification
+addresses on the application, and Microsoft documents that when those are set
+programmatically an administrator must open the application's single sign-on
+blade in the portal once before the emails actually fire. For an application
+registered in your own tenant — which is what these scripts create — **that
+blade is not reachable**: the portal serves the OpenID Connect page instead and
+offers no SAML certificate view at all. The certificates are there and working;
+the portal simply has nowhere to show them.
+
+That is the gap these scripts close. Each reports its expiry dates back to
+GitOps Manager, and Settings warns from 30 days out — on the page, and as a
+notification when the page loads.
+
+To see the certificates themselves, ask Graph rather than the portal:
+
+```bash
+az rest --method GET \
+  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/<sp-object-id>?\$select=keyCredentials,preferredTokenSigningKeyThumbprint" \
+  --query "keyCredentials[?usage=='Verify'].{expires:endDateTime}"
+```
+
+### Rotating before it lapses
+
+Re-run the same script. Inside 30 days of expiry it stops treating the existing
+credential as reusable and issues a replacement, makes it the active signing
+key, and reports the new date — which clears the warning. Outside that window a
+re-run deliberately changes nothing, so it is safe to run at any time.
+
+The previous certificate is left in place until it expires, so the rotation
+does not interrupt anyone signing in.
 
 ## Running these
 

@@ -50,14 +50,49 @@ Since nothing is stored in the script file, there's nothing to remove afterward 
 
 ## After running
 
-EKS Manager is notified automatically in step 5 — no further action is
-needed on your part. You can verify the app was created correctly in the
-Entra portal under **Enterprise Applications**, searching for "GitOps
-Manager SAML".
+EKS Manager is notified automatically in step 5 — no further action is needed
+on your part.
+
+To see the application in the portal, look under **Enterprise applications**
+for `EKS Manager SAML -- EntraSAML` (or your `PROVIDER_NAME` in place of the
+suffix). Two things about that view are worth knowing before you go looking:
+
+- The list defaults to filtering on *Application type: Enterprise
+  Applications*. The script tags the service principal so it appears there, but
+  if you are looking at one created before that tag existed, switch the filter
+  to **All Applications**.
+- Its **Single sign-on** page will show the OpenID Connect view, not a SAML
+  one, and **no certificate list at all**. That is expected for an application
+  registered in your own tenant, and does not mean SAML is misconfigured. The
+  signing certificates live on the service principal; query Graph to see them,
+  or read the expiry in GitOps Manager's Settings page.
 
 ## Re-running
 
-Safe to re-run at any time. If the Cognito SP details change (for example,
-a new environment or a Cognito domain change), re-run the script with the
-updated values — it will detect the existing app and update the redirect
-URI and identifier URI to match.
+Safe to re-run at any time, and the way to rotate.
+
+Outside 30 days of the certificate's expiry a re-run deliberately changes
+nothing: the existing application, service principal and certificate are
+detected and reused. If the Cognito details change — a new environment, a
+different Cognito domain — re-run with the updated values and the redirect URI
+and identifier URI are brought into line.
+
+**Inside 30 days of expiry** the existing certificate stops counting as
+reusable. The script issues a replacement, makes it the active signing key, and
+reports the new date, which clears the warning in Settings. The old certificate
+is left alone until it expires, so nobody's sign-in is interrupted during the
+overlap.
+
+## Certificate expiry
+
+The signing certificate is valid for three years.
+
+Do not rely on Entra to tell you when it is running out. Its expiry email needs
+notification addresses on the application, and Microsoft documents that when
+those are set programmatically an administrator must open the single sign-on
+blade in the portal once before the emails fire — and as described above, that
+blade is not reachable for an application registered in your own tenant.
+
+**Settings is the warning.** From 30 days out it shows the days remaining
+against the Entra SAML row and raises a notification when the page loads,
+becoming an error once the date has passed. Re-run this script when you see it.
