@@ -374,12 +374,34 @@ $statusBody = @{
 } | ConvertTo-Json -Compress
 
 try {
-    $response = Invoke-RestMethod -Method Post `
+    Invoke-RestMethod -Method Post `
         -Uri "$EksManagerApiUrl/config/saml/status" `
         -Headers @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" } `
-        -Body $statusBody
+        -Body $statusBody | Out-Null
 } catch {
-    Write-Error "ERROR: Failed to report SAML status to EKS Manager. $($_.Exception.Message)"
+    # $_.Exception.Message is only ever "The remote server returned an error:
+    # (500) Internal Server Error." The endpoint returns an RFC 7807 problem
+    # document naming the actual cause -- a failed stored procedure, a denied
+    # Cognito call -- and that body is what is worth reading. PowerShell 7 puts
+    # it in ErrorDetails; 5.1 leaves it on the response stream.
+    $detail = $_.ErrorDetails.Message
+    if (-not $detail -and $_.Exception.Response) {
+        try {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $detail = $reader.ReadToEnd()
+            $reader.Close()
+        } catch { }
+    }
+
+    Write-Error "ERROR: Failed to report SAML status to EKS Manager.
+$($_.Exception.Message)
+
+The server replied:
+$detail
+
+The Entra side is complete and correct -- the app registration, SAML mode and
+signing certificate are all in place. Only the report to GitOps Manager failed,
+so re-running this script once the cause is fixed will not create anything new."
     exit 1
 }
 
