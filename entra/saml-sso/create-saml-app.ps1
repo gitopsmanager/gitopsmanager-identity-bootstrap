@@ -317,6 +317,73 @@ Invoke-GraphJson -Method PATCH `
     -Body $ssoBody | Out-Null
 Write-Host "SAML SSO mode set."
 
+# -- Claims: guarantee an emailaddress claim -----------------------------------
+#
+# An application created through Graph has no claims configuration, because the
+# portal's SAML wizard is what normally writes one and these apps never go near
+# it. Entra then emits only its implicit defaults, which for a member account do
+# NOT include emailaddress -- even when the user's mail attribute is populated.
+#
+# Cognito requires an email to create a federated user, and GitOps Manager
+# matches that email against its own user records, so an assertion without one
+# fails at sign-in with "Invalid user attributes: emails: The attribute emails is
+# required" -- a message that points at Cognito and hides the cause entirely.
+#
+# Guest accounts get an emailaddress anyway, resolved from their home identity,
+# which is why a tenant whose operator is a guest appears to work and a tenant of
+# ordinary members does not.
+#
+# IncludeBasicClaimSet keeps everything Entra already emits; this only adds the
+# one claim that is missing.
+$ClaimsPolicyName = "GitOpsManager-SAML-EmailClaim"
+$ClaimsDefinition = '{"ClaimsMappingPolicy":{"Version":1,"IncludeBasicClaimSet":"true","ClaimsSchema":[{"Source":"user","ID":"mail","SamlClaimType":"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"}]}}'
+
+Write-Host "Ensuring the application emits an emailaddress claim..."
+
+$policyList = Invoke-GraphJson -Method GET `
+    -Uri "https://graph.microsoft.com/v1.0/policies/claimsMappingPolicies"
+$ClaimsPolicy = $policyList.value | Where-Object { $_.displayName -eq $ClaimsPolicyName } | Select-Object -First 1
+
+if (-not $ClaimsPolicy) {
+    $ClaimsPolicy = Invoke-GraphJson -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/policies/claimsMappingPolicies" `
+        -Body @{
+            displayName           = $ClaimsPolicyName
+            isOrganizationDefault = $false
+            definition            = @($ClaimsDefinition)
+        }
+    Write-Host "Created claims policy '$ClaimsPolicyName'."
+} else {
+    Write-Host "Reusing existing claims policy '$ClaimsPolicyName'."
+}
+
+# A service principal takes at most one claims mapping policy. If something else
+# already owns that slot, replacing it would silently change whatever configured
+# it -- so say so and stop rather than guess.
+$assigned = Invoke-GraphJson -Method GET `
+    -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/claimsMappingPolicies"
+$assignedPolicy = $assigned.value | Select-Object -First 1
+
+if (-not $assignedPolicy) {
+    Invoke-GraphJson -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpObjectId/claimsMappingPolicies/`$ref" `
+        -Body @{ '@odata.id' = "https://graph.microsoft.com/v1.0/policies/claimsMappingPolicies/$($ClaimsPolicy.id)" } | Out-Null
+    Write-Host "Claims policy assigned."
+} elseif ($assignedPolicy.id -eq $ClaimsPolicy.id) {
+    Write-Host "Claims policy already assigned."
+} else {
+    Write-Error "ERROR: this application already has a different claims mapping policy assigned:
+  '$($assignedPolicy.displayName)' ($($assignedPolicy.id))
+
+A service principal can hold only one. Replacing it could break whatever
+configured it, so this script will not do so. Check that policy emits an
+emailaddress claim sourced from the user's mail attribute, or merge this claim
+into it:
+
+  $ClaimsDefinition"
+    exit 1
+}
+
 # -- STEP 3 -- Token signing certificate ---------------------------------------
 
 Write-Host ""
