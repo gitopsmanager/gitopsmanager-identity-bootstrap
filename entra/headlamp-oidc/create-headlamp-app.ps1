@@ -655,20 +655,30 @@ function Resolve-Secret {
     if ($AzureValue) { return @{ Secret = $AzureValue; Origin = "key vault" } }
     if ($AwsValue)   { return @{ Secret = $AwsValue;   Origin = "secrets manager" } }
 
-    $credCount = az ad app credential list --id $AppId --query "length(@)" -o tsv 2>$null
+    # Counted from a list of ids rather than with length(@). On Windows 'az' is
+    # a .cmd batch file and PowerShell 5.1 only quotes an argument containing a
+    # space, so a bare length(@) reached cmd's parser, which treats parentheses
+    # as syntax -- it answered "-o was unexpected at this time" and the read
+    # failed for reasons that had nothing to do with Entra. Queries with spaces
+    # in them survive by accident; this one had none. Brackets and dots are not
+    # special to cmd, so [].keyId is safe.
+    $credOut = az ad app credential list --id $AppId --query "[].keyId" -o tsv 2>&1
 
     # Fail closed. The 'credential reset' below is the one destructive call in
     # this script -- it removes every credential the application already has --
     # and this count is the only thing standing between it and a live app. When
-    # the query itself fails (expired login, throttling, a directory role that
-    # cannot read credentials) $credCount comes back empty, and reading empty as
-    # "no credentials" would mint straight over the secret every running
-    # Headlamp is authenticating with.
-    if ($LASTEXITCODE -ne 0 -or -not $credCount) {
-        Stop-With "${Label}: could not read the existing credentials from Entra, so minting is not safe -- it would remove any secret this application already holds. Resolve the access problem az reported above and re-run."
+    # the read itself fails (expired login, throttling, a directory role that
+    # cannot read credentials) treating that as "no credentials" would mint
+    # straight over the secret every running Headlamp is authenticating with.
+    if ($LASTEXITCODE -ne 0) {
+        Stop-With ("${Label}: could not read the existing credentials from Entra, so minting " +
+                   "is not safe -- it would remove any secret this application already holds." +
+                   "`n`naz reported:`n`n" + ($credOut -join "`n"))
     }
 
-    if ([int]$credCount -gt 0) {
+    $credCount = @($credOut | Where-Object { "$_".Trim() }).Count
+
+    if ($credCount -gt 0) {
         Stop-With "$Label already has $credCount client secret(s), and Entra does not return one after creation. No enabled store holds it, so it cannot be recovered.`n`nRe-run including the store that does hold it, or rotate deliberately -- a rotation invalidates the credential every running Headlamp is using and needs every cluster refreshed."
     }
 
