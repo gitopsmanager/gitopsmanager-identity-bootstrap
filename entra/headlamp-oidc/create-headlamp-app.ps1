@@ -112,7 +112,11 @@ $EksManagerClientSecret = $env:EKSMANAGER_CLIENT_SECRET
 function Write-Step  { param($m) Write-Host "" ; Write-Host "[INFO] $m" -ForegroundColor Cyan }
 function Write-Good  { param($m) Write-Host "[OK] $m"   -ForegroundColor Green }
 function Write-Warn2 { param($m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
-function Stop-With   { param($m) Write-Error $m ; exit 1 }
+# Write-Error wraps the message in PowerShell's error decoration -- the "At
+# line:N char:M", the source extract, the CategoryInfo -- which buries a
+# multi-line instruction the operator is meant to read and act on. Straight to
+# stderr keeps the stream correct for CI without the noise.
+function Stop-With   { param($m) [Console]::Error.WriteLine("`n[ERROR] $m`n") ; exit 1 }
 
 function ConvertTo-B64 { param([string]$s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
 function ConvertFrom-B64 { param([string]$s) [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
@@ -217,17 +221,102 @@ function Install-CliIfMissing {
 # first avoids it entirely.
 # =============================================================================
 
-Write-Step "Preflight: Entra"
+# -----------------------------------------------------------------------------
+# Sign-in gate
+#
+# Every cloud this run touches is proven here, and all failures are reported in
+# one message. Checking each where it is first needed meant an operator signed
+# in to neither fixed Azure, re-ran, sat through the Entra and API preflights,
+# and only then learned AWS was missing too -- two round trips for one setup
+# problem. -KeyVault needs Azure; -EnableAws needs AWS; Entra is always needed.
+# -----------------------------------------------------------------------------
+Write-Step "Preflight: sign-in"
 
 Install-CliIfMissing -Command "az" -FriendlyName "Azure CLI" `
     -WingetId "Microsoft.AzureCLI" -ManualUrl "https://aka.ms/installazurecliwindows"
+if ($EnableAws) {
+    Install-CliIfMissing -Command "aws" -FriendlyName "AWS CLI" `
+        -WingetId "Amazon.AWSCLI" -ManualUrl "https://aws.amazon.com/cli/"
+}
+
+$signInErrors = @()
 
 try   { $account = az account show 2>$null | ConvertFrom-Json }
 catch { $account = $null }
-if (-not $account) {
-    Stop-With "Not signed in to Azure. Run 'az login', or 'az login --allow-no-subscriptions' if this tenant has no subscription."
+if ($account) {
+    $TenantId = $account.tenantId
+    Write-Good "Azure: tenant $TenantId."
+} else {
+    $signInErrors += @"
+Azure -- not signed in. The Entra applications live here, so this is always
+required, with or without -EnableAws.
+
+    az login
+    az login --allow-no-subscriptions    # tenant with no subscription
+"@
 }
-$TenantId = $account.tenantId
+
+if ($EnableAws) {
+    # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
+    # Terraform environment block as the EKSMANAGER_* credentials, so both are
+    # required rather than best-effort. This writes to Secrets Manager and uses
+    # EKSManagerCMK, both of which live in the SHARED SERVICES account, and
+    # nothing here assumes a role to get there -- the session has to be the
+    # right one to begin with. Treating the expected account as optional made
+    # the check skip itself in exactly the case it exists to catch.
+    $AwsRegion       = $env:REGION
+    $ExpectedAccount = $env:SHARED_SERVICES_ACCOUNT_ID
+
+    $unsetVars = @()
+    if (-not $AwsRegion)       { $unsetVars += "REGION" }
+    if (-not $ExpectedAccount) { $unsetVars += "SHARED_SERVICES_ACCOUNT_ID" }
+
+    if ($unsetVars.Count -gt 0) {
+        $signInErrors += "AWS -- not set: $($unsetVars -join ', ').`n`n" +
+                         "    Paste the environment block from Settings -> Terraform tile."
+    } else {
+        # Every aws call passes --region explicitly; this covers the CLI's own
+        # need for one on calls that do not, sts included.
+        $env:AWS_REGION = $AwsRegion
+
+        $AwsAccount = aws sts get-caller-identity --query "Account" --output text 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $AwsAccount) {
+            # On a machine with named profiles this is a selection problem, not
+            # a sign-in problem, and "sign in and retry" sends the operator
+            # looking in the wrong place. Name what is configured.
+            $awsProfiles = @(aws configure list-profiles 2>$null)
+            $hint = if ($awsProfiles.Count -gt 0) {
+                "    Configured profiles: " + ($awsProfiles -join ', ') + "`n`n" +
+                '    $env:AWS_PROFILE = "<profile>"' + "`n" +
+                '    aws sso login --profile <profile>    # if the session has lapsed'
+            } else {
+                "    No named profiles are configured."
+            }
+            $signInErrors += "AWS -- no usable credentials. -EnableAws was passed, so shared`n" +
+                             "services account $ExpectedAccount is required.`n`n$hint"
+        } elseif ($ExpectedAccount -ne $AwsAccount) {
+            $signInErrors += @"
+AWS -- wrong account.
+
+    Signed in to : $AwsAccount
+    Expected     : $ExpectedAccount  (shared services)
+
+    This script does not assume a role to get there. Worth knowing:
+    setup-pipeline.ps1 runs from the MANAGEMENT account and this one does
+    not, which is an easy thing to carry over out of habit.
+"@
+        } else {
+            Write-Good "AWS: shared services account $AwsAccount in $AwsRegion."
+        }
+    }
+}
+
+if ($signInErrors.Count -gt 0) {
+    Stop-With ("Not signed in to everything this run needs.`n`n" +
+               ($signInErrors -join "`n`n") + "`n`nFix all of the above, then re-run.")
+}
+
+Write-Step "Preflight: Entra"
 
 # 'az ad app list' has no --top. A filter that cannot match anything is the
 # cheapest call that still exercises the /applications read the rest of this
@@ -284,48 +373,11 @@ if ($KeyVault) {
 
 if ($EnableAws) {
     Write-Step "Preflight: AWS Secrets Manager"
-    Install-CliIfMissing -Command "aws" -FriendlyName "AWS CLI" `
-        -WingetId "Amazon.AWSCLI" -ManualUrl "https://aws.amazon.com/cli/"
 
-    # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
-    # Terraform environment block as the EKSMANAGER_* credentials above, so
-    # both are required rather than best-effort. This writes to Secrets Manager
-    # and uses EKSManagerCMK, both of which live in the SHARED SERVICES
-    # account, and nothing here assumes a role to get there -- the session has
-    # to be the right one to begin with. Treating the expected account as
-    # optional made the check skip itself in exactly the case it exists to
-    # catch: an operator who did not know to supply it.
-    $AwsRegion = $env:REGION
-    if (-not $AwsRegion) {
-        Stop-With "REGION is not set. Paste the environment block from Settings -> Terraform, then re-run."
-    }
-    $ExpectedAccount = $env:SHARED_SERVICES_ACCOUNT_ID
-    if (-not $ExpectedAccount) {
-        Stop-With "SHARED_SERVICES_ACCOUNT_ID is not set. Paste the environment block from Settings -> Terraform, then re-run."
-    }
-
-    # Every aws call below passes --region explicitly; this covers the CLI's own
-    # need for one on calls that do not, sts included.
-    $env:AWS_REGION = $AwsRegion
-
-    $AwsAccount = aws sts get-caller-identity --query "Account" --output text 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $AwsAccount) { Stop-With "No usable AWS credentials. Sign in, then retry." }
-
-    if ($ExpectedAccount -ne $AwsAccount) {
-        Stop-With @"
-Wrong AWS account.
-
-    Signed in to : $AwsAccount
-    Expected     : $ExpectedAccount  (shared services)
-
-Sign in with credentials for the shared services account and re-run. This
-script does not assume a role to get there.
-
-Worth knowing: setup-pipeline.ps1 runs from the MANAGEMENT account. This one
-does not, which is an easy thing to carry over out of habit.
-"@
-    }
-
+    # Credentials, region, and the account match are all settled by the sign-in
+    # gate above. What is left is the one thing a successful sts call does not
+    # prove: that this identity can actually write.
+    #
     # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.
     aws secretsmanager create-secret --name $SmProbeName --secret-string "probe" --region $AwsRegion 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {

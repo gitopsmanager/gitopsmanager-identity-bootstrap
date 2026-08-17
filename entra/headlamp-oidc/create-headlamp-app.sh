@@ -118,11 +118,100 @@ error()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 # first avoids it entirely.
 # =============================================================================
 
-info "Preflight: Entra"
+# -----------------------------------------------------------------------------
+# Sign-in gate
+#
+# Every cloud this run touches is proven here, and all failures are reported in
+# one message. Checking each where it is first needed meant an operator signed
+# in to neither fixed Azure, re-ran, sat through the Entra and API preflights,
+# and only then learned AWS was missing too -- two round trips for one setup
+# problem. --key-vault needs Azure; --enable-aws needs AWS; Entra is always
+# needed.
+# -----------------------------------------------------------------------------
+info "Preflight: sign-in"
+
+SIGNIN_ERRORS=""
+add_signin_error() { SIGNIN_ERRORS="${SIGNIN_ERRORS}${SIGNIN_ERRORS:+
+
+}$1"; }
+
 TENANT_ID=$(az account show --query "tenantId" -o tsv 2>/dev/null || true)
-if [[ -z "$TENANT_ID" ]]; then
-  error "Not signed in to Azure. Run 'az login' first."
+if [[ -n "$TENANT_ID" ]]; then
+  success "Azure: tenant $TENANT_ID."
+else
+  add_signin_error "Azure -- not signed in. The Entra applications live here, so this is
+       always required, with or without --enable-aws.
+
+           az login
+           az login --allow-no-subscriptions    # tenant with no subscription"
 fi
+
+if [[ "$ENABLE_AWS" == "true" ]]; then
+  # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
+  # Terraform environment block as the EKSMANAGER_* credentials, so both are
+  # required rather than best-effort. This writes to Secrets Manager and uses
+  # EKSManagerCMK, both of which live in the SHARED SERVICES account, and
+  # nothing here assumes a role to get there -- the session has to be the right
+  # one to begin with. Treating the expected account as optional made the check
+  # skip itself in exactly the case it exists to catch.
+  AWS_REGION_RESOLVED="${REGION:-}"
+  EXPECTED_ACCOUNT="${SHARED_SERVICES_ACCOUNT_ID:-}"
+
+  UNSET_VARS=""
+  [[ -z "$AWS_REGION_RESOLVED" ]] && UNSET_VARS="REGION"
+  [[ -z "$EXPECTED_ACCOUNT"    ]] && UNSET_VARS="${UNSET_VARS}${UNSET_VARS:+, }SHARED_SERVICES_ACCOUNT_ID"
+
+  if [[ -n "$UNSET_VARS" ]]; then
+    add_signin_error "AWS -- not set: ${UNSET_VARS}.
+
+           Paste the environment block from Settings -> Terraform tile."
+  else
+    # Every aws call passes --region explicitly; this covers the CLI's own need
+    # for one on calls that do not, sts included.
+    export AWS_REGION="$AWS_REGION_RESOLVED"
+
+    AWS_ACCOUNT=$(aws sts get-caller-identity --query "Account" -o text 2>/dev/null || true)
+    if [[ -z "$AWS_ACCOUNT" ]]; then
+      # On a machine with named profiles this is a selection problem, not a
+      # sign-in problem, and "sign in and retry" sends the operator looking in
+      # the wrong place. Name what is configured.
+      AWS_PROFILES=$(aws configure list-profiles 2>/dev/null | paste -sd', ' - || true)
+      if [[ -n "$AWS_PROFILES" ]]; then
+        PROFILE_HINT="           Configured profiles: ${AWS_PROFILES}
+
+           export AWS_PROFILE=<profile>
+           aws sso login --profile <profile>    # if the session has lapsed"
+      else
+        PROFILE_HINT="           No named profiles are configured."
+      fi
+      add_signin_error "AWS -- no usable credentials. --enable-aws was passed, so shared
+       services account ${EXPECTED_ACCOUNT} is required.
+
+${PROFILE_HINT}"
+    elif [[ "$EXPECTED_ACCOUNT" != "$AWS_ACCOUNT" ]]; then
+      add_signin_error "AWS -- wrong account.
+
+           Signed in to : ${AWS_ACCOUNT}
+           Expected     : ${EXPECTED_ACCOUNT}  (shared services)
+
+           This script does not assume a role to get there. Worth knowing:
+           setup-pipeline.sh runs from the MANAGEMENT account and this one
+           does not, which is an easy thing to carry over out of habit."
+    else
+      success "AWS: shared services account $AWS_ACCOUNT in $AWS_REGION_RESOLVED."
+    fi
+  fi
+fi
+
+if [[ -n "$SIGNIN_ERRORS" ]]; then
+  error "Not signed in to everything this run needs.
+
+${SIGNIN_ERRORS}
+
+       Fix all of the above, then re-run."
+fi
+
+info "Preflight: Entra"
 # 'az ad app list' has no --top. A filter that cannot match anything is the
 # cheapest call that still exercises the /applications read the rest of this
 # script depends on, and it returns an empty list rather than the whole
@@ -165,45 +254,11 @@ fi
 
 if [[ "$ENABLE_AWS" == "true" ]]; then
   info "Preflight: AWS Secrets Manager"
-  # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
-  # Terraform environment block as the EKSMANAGER_* credentials above, so both
-  # are required rather than best-effort. This writes to Secrets Manager and
-  # uses EKSManagerCMK, both of which live in the SHARED SERVICES account, and
-  # nothing here assumes a role to get there -- the session has to be the right
-  # one to begin with. Treating the expected account as optional made the check
-  # skip itself in exactly the case it exists to catch: an operator who did not
-  # know to supply it.
-  AWS_REGION_RESOLVED="${REGION:-}"
-  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
-    error "REGION is not set. Paste the environment block from Settings -> Terraform, then re-run."
-  fi
-  EXPECTED_ACCOUNT="${SHARED_SERVICES_ACCOUNT_ID:-}"
-  if [[ -z "$EXPECTED_ACCOUNT" ]]; then
-    error "SHARED_SERVICES_ACCOUNT_ID is not set. Paste the environment block from Settings -> Terraform, then re-run."
-  fi
 
-  # Every aws call below passes --region explicitly; this covers the CLI's own
-  # need for one on calls that do not, sts included.
-  export AWS_REGION="$AWS_REGION_RESOLVED"
-
-  AWS_ACCOUNT=$(aws sts get-caller-identity --query "Account" -o text 2>/dev/null || true)
-  if [[ -z "$AWS_ACCOUNT" ]]; then
-    error "No usable AWS credentials. Sign in, then retry."
-  fi
-
-  if [[ "$EXPECTED_ACCOUNT" != "$AWS_ACCOUNT" ]]; then
-    error "Wrong AWS account.
-
-       Signed in to : $AWS_ACCOUNT
-       Expected     : ${EXPECTED_ACCOUNT}  (shared services)
-
-       Sign in with credentials for the shared services account and re-run.
-       This script does not assume a role to get there.
-
-       Worth knowing: setup-pipeline.sh runs from the MANAGEMENT account. This
-       one does not, which is an easy thing to carry over out of habit."
-  fi
-
+  # Credentials, region, and the account match are all settled by the sign-in
+  # gate above. What is left is the one thing a successful sts call does not
+  # prove: that this identity can actually write.
+  #
   # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.
   aws secretsmanager create-secret --name "$SM_PROBE_NAME" --secret-string "probe" \
     --region "$AWS_REGION_RESOLVED" >/dev/null 2>&1 \
