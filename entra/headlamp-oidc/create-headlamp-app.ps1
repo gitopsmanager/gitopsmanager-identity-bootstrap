@@ -160,43 +160,67 @@ function Invoke-GraphJson {
     finally { Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue }
 }
 
-# Offers to install a missing CLI rather than just naming it. Asks first --
-# installing software on someone's machine is not something to do because a
-# script felt like it.
-function Install-CliIfMissing {
-    param(
-        [string] $Command,
-        [string] $FriendlyName,
-        [string] $WingetId,
-        [string] $ManualUrl
-    )
+# Offers to install everything missing rather than just naming it, and does so
+# in one pass. Asks first -- installing software on someone's machine is not
+# something to do because a script felt like it -- but asks once, with the full
+# list. Handling one CLI per call meant an operator with neither installed
+# installed the Azure CLI, re-ran, and only then learned the AWS CLI was also
+# missing.
+#
+# $Required is a list of @{ Command; FriendlyName; WingetId; ManualUrl }.
+function Install-MissingClis {
+    param([array] $Required)
 
-    if (Get-Command $Command -ErrorAction SilentlyContinue) { return }
+    $missing = @($Required | Where-Object { -not (Get-Command $_.Command -ErrorAction SilentlyContinue) })
+    if ($missing.Count -eq 0) { return }
 
     Write-Host ""
-    Write-Warn2 "$FriendlyName is not installed."
+    foreach ($m in $missing) { Write-Warn2 "$($m.FriendlyName) is not installed." }
+
+    $manual = ($missing | ForEach-Object { "    $($_.FriendlyName): $($_.ManualUrl)" }) -join "`n"
 
     # Never prompt where nothing can answer. A script that hangs waiting for
     # input inside automation is worse than one that fails with instructions.
     if (-not [Environment]::UserInteractive) {
-        Stop-With "$FriendlyName is required. Install it from $ManualUrl and re-run."
+        Stop-With "Required, and not installed:`n`n$manual"
     }
 
+    # Name how to get winget too. Sending someone to two vendor download pages
+    # when one command would have done it is what this function exists to avoid,
+    # and winget's absence is not obvious to fix if you have not met it before.
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Stop-With "$FriendlyName is required, and winget is not available on this machine to install it. Install from $ManualUrl and re-run."
+        Stop-With @"
+Required, and not installed:
+
+$manual
+
+winget is not on this machine, so they cannot be installed for you. It ships as
+"App Installer":
+
+    Microsoft Store  ->  search "App Installer"
+    or               ->  https://github.com/microsoft/winget-cli/releases
+
+Install that and re-run to be offered both, or install each of the above by hand.
+"@
     }
 
     Write-Host ""
-    Write-Host "    winget install -e --id $WingetId" -ForegroundColor Cyan
+    foreach ($m in $missing) {
+        Write-Host "    winget install -e --id $($m.WingetId)" -ForegroundColor Cyan
+    }
     Write-Host ""
-    $answer = Read-Host "Type 'yes' to run that now, or anything else to stop"
+    $what   = if ($missing.Count -gt 1) { "those $($missing.Count) commands" } else { "that" }
+    $answer = Read-Host "Type 'yes' to run $what now, or anything else to stop"
     if ($answer -ne "yes") {
-        Stop-With "$FriendlyName is required. Install it from $ManualUrl and re-run."
+        Stop-With "Required, and not installed:`n`n$manual"
     }
 
-    winget install -e --id $WingetId --accept-package-agreements --accept-source-agreements
-    if ($LASTEXITCODE -ne 0) {
-        Stop-With "winget did not complete successfully. Install $FriendlyName from $ManualUrl and re-run."
+    foreach ($m in $missing) {
+        Write-Step "Installing $($m.FriendlyName)..."
+        winget install -e --id $m.WingetId --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -ne 0) {
+            Stop-With "winget did not install $($m.FriendlyName) successfully. Install it from $($m.ManualUrl) and re-run."
+        }
     }
 
     # winget writes the new location into the machine PATH, but this process
@@ -205,10 +229,12 @@ function Install-CliIfMissing {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
-        Stop-With "$FriendlyName installed, but '$Command' is still not on PATH. Open a new PowerShell session and re-run."
+    foreach ($m in $missing) {
+        if (-not (Get-Command $m.Command -ErrorAction SilentlyContinue)) {
+            Stop-With "$($m.FriendlyName) installed, but '$($m.Command)' is still not on PATH. Open a new PowerShell session and re-run."
+        }
+        Write-Good "$($m.FriendlyName) installed."
     }
-    Write-Good "$FriendlyName installed."
 }
 
 # =============================================================================
@@ -232,12 +258,17 @@ function Install-CliIfMissing {
 # -----------------------------------------------------------------------------
 Write-Step "Preflight: sign-in"
 
-Install-CliIfMissing -Command "az" -FriendlyName "Azure CLI" `
-    -WingetId "Microsoft.AzureCLI" -ManualUrl "https://aka.ms/installazurecliwindows"
+# Both are resolved before either is checked, so an operator starting from a
+# bare machine is offered everything this run needs in one prompt.
+$requiredClis = @(
+    @{ Command = "az"; FriendlyName = "Azure CLI"; WingetId = "Microsoft.AzureCLI"
+       ManualUrl = "https://aka.ms/installazurecliwindows" }
+)
 if ($EnableAws) {
-    Install-CliIfMissing -Command "aws" -FriendlyName "AWS CLI" `
-        -WingetId "Amazon.AWSCLI" -ManualUrl "https://aws.amazon.com/cli/"
+    $requiredClis += @{ Command = "aws"; FriendlyName = "AWS CLI"; WingetId = "Amazon.AWSCLI"
+                        ManualUrl = "https://aws.amazon.com/cli/" }
 }
+Install-MissingClis $requiredClis
 
 $signInErrors = @()
 
