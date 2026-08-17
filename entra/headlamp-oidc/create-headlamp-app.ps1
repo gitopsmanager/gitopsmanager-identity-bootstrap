@@ -60,7 +60,20 @@ param(
     [string] $Trust
 )
 
-$ErrorActionPreference = "Stop"
+# Deliberately not "Stop". PowerShell 5.1 converts a native command's stderr
+# into ErrorRecords whenever that stream is redirected -- 2>$null counts -- and
+# under "Stop" the first such line becomes a terminating error. az writes
+# warnings and ordinary "not found" messages to stderr all the time, so every
+# "call az, then check $LASTEXITCODE" below would abort on output it was
+# written to tolerate: probing Key Vault for a secret that is not there,
+# listing credentials on an application that has none, reading tags off a new
+# service principal.
+#
+# Native failures are caught explicitly instead -- every az call is followed by
+# a $LASTEXITCODE test, and Invoke-GraphJson enforces it for Graph writes.
+# Cmdlets whose silent failure would matter carry -ErrorAction Stop where they
+# are called.
+$ErrorActionPreference = "Continue"
 
 if (-not $KeyVault -and -not $EnableAws) {
     Write-Error "Nothing to do -- pass -KeyVault, -EnableAws, or both."
@@ -126,10 +139,13 @@ function Invoke-GraphJson {
         [string] $ErrorMessage
     )
 
-    $bodyFile = New-TemporaryFile
+    # -ErrorAction Stop on both: a body file that silently failed to write would
+    # be sent to Graph as an empty document, and an empty PATCH of "tags" or
+    # "redirectUris" clears the property rather than failing.
+    $bodyFile = New-TemporaryFile -ErrorAction Stop
     try {
         $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Compress -Depth 5 }
-        $json | Set-Content -Path $bodyFile.FullName -Encoding ascii
+        $json | Set-Content -Path $bodyFile.FullName -Encoding ascii -ErrorAction Stop
 
         az rest --method $Method --uri $Uri `
             --headers "Content-Type=application/json" `
@@ -213,7 +229,12 @@ if (-not $account) {
 }
 $TenantId = $account.tenantId
 
-az ad app list --top 1 --query "[0].appId" -o tsv 2>$null | Out-Null
+# 'az ad app list' has no --top. A filter that cannot match anything is the
+# cheapest call that still exercises the /applications read the rest of this
+# script depends on, and it returns an empty list rather than the whole
+# directory.
+az ad app list --filter "appId eq '00000000-0000-0000-0000-000000000000'" `
+    --query "[0].appId" -o tsv 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Stop-With "Cannot read applications in tenant $TenantId. Check your directory role."
 }
@@ -266,24 +287,36 @@ if ($EnableAws) {
     Install-CliIfMissing -Command "aws" -FriendlyName "AWS CLI" `
         -WingetId "Amazon.AWSCLI" -ManualUrl "https://aws.amazon.com/cli/"
 
+    # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
+    # Terraform environment block as the EKSMANAGER_* credentials above, so
+    # both are required rather than best-effort. This writes to Secrets Manager
+    # and uses EKSManagerCMK, both of which live in the SHARED SERVICES
+    # account, and nothing here assumes a role to get there -- the session has
+    # to be the right one to begin with. Treating the expected account as
+    # optional made the check skip itself in exactly the case it exists to
+    # catch: an operator who did not know to supply it.
+    $AwsRegion = $env:REGION
+    if (-not $AwsRegion) {
+        Stop-With "REGION is not set. Paste the environment block from Settings -> Terraform, then re-run."
+    }
+    $ExpectedAccount = $env:SHARED_SERVICES_ACCOUNT_ID
+    if (-not $ExpectedAccount) {
+        Stop-With "SHARED_SERVICES_ACCOUNT_ID is not set. Paste the environment block from Settings -> Terraform, then re-run."
+    }
+
+    # Every aws call below passes --region explicitly; this covers the CLI's own
+    # need for one on calls that do not, sts included.
+    $env:AWS_REGION = $AwsRegion
+
     $AwsAccount = aws sts get-caller-identity --query "Account" --output text 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $AwsAccount) { Stop-With "No usable AWS credentials. Sign in, then retry." }
 
-    $AwsRegion = if ($env:AWS_REGION) { $env:AWS_REGION }
-                 elseif ($env:AWS_DEFAULT_REGION) { $env:AWS_DEFAULT_REGION }
-                 else { aws configure get region 2>$null }
-    if (-not $AwsRegion) { Stop-With "No AWS region resolved. Set AWS_REGION and retry." }
-
-    # This writes to Secrets Manager and uses EKSManagerCMK, both of which live
-    # in the SHARED SERVICES account. Nothing is assumed to get there -- so the
-    # session has to be the right one to begin with, and this check is the only
-    # thing standing between a wrong session and a secret in the wrong account.
-    if ($env:EKSMANAGER_AWS_ACCOUNT_ID -and $env:EKSMANAGER_AWS_ACCOUNT_ID -ne $AwsAccount) {
+    if ($ExpectedAccount -ne $AwsAccount) {
         Stop-With @"
 Wrong AWS account.
 
     Signed in to : $AwsAccount
-    Expected     : $($env:EKSMANAGER_AWS_ACCOUNT_ID)  (shared services)
+    Expected     : $ExpectedAccount  (shared services)
 
 Sign in with credentials for the shared services account and re-run. This
 script does not assume a role to get there.
@@ -291,13 +324,6 @@ script does not assume a role to get there.
 Worth knowing: setup-pipeline.ps1 runs from the MANAGEMENT account. This one
 does not, which is an easy thing to carry over out of habit.
 "@
-    }
-    if ($env:EKSMANAGER_AWS_REGION -and $env:EKSMANAGER_AWS_REGION -ne $AwsRegion) {
-        Stop-With "AWS region is $AwsRegion but this installation expects $($env:EKSMANAGER_AWS_REGION)."
-    }
-    if (-not $env:EKSMANAGER_AWS_ACCOUNT_ID) {
-        Write-Warn2 "The expected account was not supplied in the environment, so this session cannot be checked."
-        Write-Warn2 "About to write to $AwsAccount / $AwsRegion -- confirm that is your shared services account."
     }
 
     # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.

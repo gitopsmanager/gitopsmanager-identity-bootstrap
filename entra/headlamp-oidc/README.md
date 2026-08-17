@@ -124,10 +124,11 @@ unrecoverable failure here.
 
 So the preflight proves everything first: Azure sign-in and directory read, the
 EKS Manager token, and an actual **probe write** to each enabled store. The AWS
-probe also proves `kms:GenerateDataKey` on `EKSManagerCMK` end to end. Where the
-environment says which AWS account and region to expect, the resolved session is
-checked against them — the ambient profile is convenient and is exactly how
-someone writes to the wrong account.
+probe also proves `kms:GenerateDataKey` on `EKSManagerCMK` end to end. The
+resolved session is checked against the `SHARED_SERVICES_ACCOUNT_ID` and
+`REGION` the environment supplies, and the run stops if either is absent — the
+ambient profile is convenient and is exactly how someone writes to the wrong
+account, so a check that can skip itself is no check at all.
 
 ## How a secret is resolved
 

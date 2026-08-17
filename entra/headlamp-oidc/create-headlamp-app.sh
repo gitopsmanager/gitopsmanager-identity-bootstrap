@@ -123,7 +123,12 @@ TENANT_ID=$(az account show --query "tenantId" -o tsv 2>/dev/null || true)
 if [[ -z "$TENANT_ID" ]]; then
   error "Not signed in to Azure. Run 'az login' first."
 fi
-az ad app list --top 1 --query "[0].appId" -o tsv >/dev/null 2>&1 \
+# 'az ad app list' has no --top. A filter that cannot match anything is the
+# cheapest call that still exercises the /applications read the rest of this
+# script depends on, and it returns an empty list rather than the whole
+# directory.
+az ad app list --filter "appId eq '00000000-0000-0000-0000-000000000000'" \
+  --query "[0].appId" -o tsv >/dev/null 2>&1 \
   || error "Cannot read applications in tenant $TENANT_ID. Check your directory role."
 success "Tenant $TENANT_ID, directory readable."
 
@@ -160,41 +165,43 @@ fi
 
 if [[ "$ENABLE_AWS" == "true" ]]; then
   info "Preflight: AWS Secrets Manager"
+  # REGION and SHARED_SERVICES_ACCOUNT_ID come from the same Settings ->
+  # Terraform environment block as the EKSMANAGER_* credentials above, so both
+  # are required rather than best-effort. This writes to Secrets Manager and
+  # uses EKSManagerCMK, both of which live in the SHARED SERVICES account, and
+  # nothing here assumes a role to get there -- the session has to be the right
+  # one to begin with. Treating the expected account as optional made the check
+  # skip itself in exactly the case it exists to catch: an operator who did not
+  # know to supply it.
+  AWS_REGION_RESOLVED="${REGION:-}"
+  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
+    error "REGION is not set. Paste the environment block from Settings -> Terraform, then re-run."
+  fi
+  EXPECTED_ACCOUNT="${SHARED_SERVICES_ACCOUNT_ID:-}"
+  if [[ -z "$EXPECTED_ACCOUNT" ]]; then
+    error "SHARED_SERVICES_ACCOUNT_ID is not set. Paste the environment block from Settings -> Terraform, then re-run."
+  fi
+
+  # Every aws call below passes --region explicitly; this covers the CLI's own
+  # need for one on calls that do not, sts included.
+  export AWS_REGION="$AWS_REGION_RESOLVED"
+
   AWS_ACCOUNT=$(aws sts get-caller-identity --query "Account" -o text 2>/dev/null || true)
   if [[ -z "$AWS_ACCOUNT" ]]; then
     error "No usable AWS credentials. Sign in, then retry."
   fi
-  AWS_REGION_RESOLVED="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
-    AWS_REGION_RESOLVED=$(aws configure get region 2>/dev/null || true)
-  fi
-  if [[ -z "$AWS_REGION_RESOLVED" ]]; then
-    error "No AWS region resolved. Set AWS_REGION and retry."
-  fi
 
-  # This writes to Secrets Manager and uses EKSManagerCMK, both of which live in
-  # the SHARED SERVICES account. Nothing is assumed to get there -- so the
-  # session has to be the right one to begin with, and the only thing standing
-  # between a wrong session and a secret written to the wrong account is this
-  # check.
-  if [[ -n "${EKSMANAGER_AWS_ACCOUNT_ID:-}" && "$EKSMANAGER_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT" ]]; then
+  if [[ "$EXPECTED_ACCOUNT" != "$AWS_ACCOUNT" ]]; then
     error "Wrong AWS account.
 
        Signed in to : $AWS_ACCOUNT
-       Expected     : ${EKSMANAGER_AWS_ACCOUNT_ID}  (shared services)
+       Expected     : ${EXPECTED_ACCOUNT}  (shared services)
 
        Sign in with credentials for the shared services account and re-run.
        This script does not assume a role to get there.
 
        Worth knowing: setup-pipeline.sh runs from the MANAGEMENT account. This
        one does not, which is an easy thing to carry over out of habit."
-  fi
-  if [[ -n "${EKSMANAGER_AWS_REGION:-}" && "$EKSMANAGER_AWS_REGION" != "$AWS_REGION_RESOLVED" ]]; then
-    error "AWS region is $AWS_REGION_RESOLVED but this installation expects ${EKSMANAGER_AWS_REGION}."
-  fi
-  if [[ -z "${EKSMANAGER_AWS_ACCOUNT_ID:-}" ]]; then
-    warn "The expected account was not supplied in the environment, so this session cannot be checked."
-    warn "About to write to $AWS_ACCOUNT / $AWS_REGION_RESOLVED -- confirm that is your shared services account."
   fi
 
   # Proves the write path and kms:GenerateDataKey on EKSManagerCMK end to end.
