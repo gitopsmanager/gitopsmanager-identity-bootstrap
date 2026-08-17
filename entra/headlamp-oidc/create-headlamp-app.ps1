@@ -487,16 +487,28 @@ function Set-PortalTag {
     param([string]$SpId)
 
     $existing = az ad sp show --id $SpId --query "tags" -o json 2>$null
-    $tags = @()
-    if ($existing) { $tags = @($existing | ConvertFrom-Json) }
+
+    # Enumerate rather than wrap. An untagged principal returns "[]", and
+    # ConvertFrom-Json yields that as a single empty-array object, not as no
+    # items -- so @($existing | ConvertFrom-Json) produced a one-element list
+    # whose only element was itself an array. ConvertTo-Json then rendered it
+    # as {"value":[],"Count":0} and Graph rejected the PATCH with "An
+    # unexpected 'StartObject' node was found ... A 'PrimitiveValue' node was
+    # expected." A typed list of strings cannot take that shape.
+    $tags = [System.Collections.Generic.List[string]]::new()
+    if ($existing) {
+        foreach ($t in (ConvertFrom-Json -InputObject $existing)) {
+            if ($null -ne $t -and "$t" -ne "") { $tags.Add([string]$t) }
+        }
+    }
     if ($tags -contains $PortalTag) { return }   # already tagged, leave it alone
 
     # PATCH replaces tags wholesale, so carry forward any already present.
-    $tags += $PortalTag
+    $tags.Add($PortalTag)
 
     Invoke-GraphJson -Method PATCH `
         -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpId" `
-        -Body @{ tags = $tags } `
+        -Body @{ tags = @($tags) } `
         -ErrorMessage "Could not tag service principal $SpId -- az reported the reason above."
 
     Write-Good "Tagged as an enterprise application so it appears in the portal list."
