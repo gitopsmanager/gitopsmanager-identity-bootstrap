@@ -256,6 +256,100 @@ Install that and re-run to be offered both, or install each of the above by hand
 # and only then learned AWS was missing too -- two round trips for one setup
 # problem. -KeyVault needs Azure; -EnableAws needs AWS; Entra is always needed.
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# TLS trust
+#
+# az and aws are Python. They validate certificates against their own bundled
+# CA list, not the Windows certificate store. On a corporate network that
+# decrypts and re-signs TLS -- Zscaler, Netskope, and the like -- the browser
+# accepts the re-signed certificate because the inspection root is installed in
+# Windows, and both CLIs reject it. What the operator sees is a Python
+# traceback in the middle of a preflight, which says nothing about the cause.
+#
+# Trusting what the machine already trusts is not a security downgrade, so this
+# resolves it rather than reporting it: export the Windows roots to a PEM and
+# point both CLIs at that. Verification stays on throughout -- nothing here
+# passes --no-verify or AZURE_CLI_DISABLE_CONNECTION_VERIFICATION, which would
+# turn off validation for a session that is about to read and write secrets.
+# -----------------------------------------------------------------------------
+function Test-TlsTrustFailure {
+    param($Output)
+    $t = ($Output | Out-String)
+    return $t -match 'CERTIFICATE_VERIFY_FAILED|certificate verify failed|SSLError|SSLCertVerificationError|unable to get local issuer|self.signed certificate|SSL: '
+}
+
+# Names the interceptor in the failure message. .NET validates against the
+# Windows store, so this succeeds where the CLIs fail -- which is the whole
+# point: it can see the certificate they are refusing.
+function Get-ServedCertIssuer {
+    param([string] $Uri)
+    try {
+        $r = [System.Net.HttpWebRequest]::Create($Uri)
+        $r.Timeout = 10000
+        $r.ServerCertificateValidationCallback = { $true }
+        try { $r.GetResponse().Dispose() } catch { }
+        if ($r.ServicePoint.Certificate) { return $r.ServicePoint.Certificate.Issuer }
+    } catch { }
+    return $null
+}
+
+$script:CaBundleApplied = $false
+
+function Set-CorporateCaBundle {
+    if ($script:CaBundleApplied) { return $true }
+
+    # An operator who has already pointed these somewhere gets left alone. A
+    # bundle that is set but wrong is its own problem, and silently replacing
+    # their choice would hide it.
+    if ($env:REQUESTS_CA_BUNDLE -or $env:AWS_CA_BUNDLE -or $env:SSL_CERT_FILE) {
+        Write-Warn2 "A CA bundle is already set in this session -- leaving it alone."
+        Write-Warn2 "  REQUESTS_CA_BUNDLE = $env:REQUESTS_CA_BUNDLE"
+        Write-Warn2 "  AWS_CA_BUNDLE      = $env:AWS_CA_BUNDLE"
+        Write-Warn2 "  SSL_CERT_FILE      = $env:SSL_CERT_FILE"
+        return $false
+    }
+
+    $bundle = Join-Path $env:USERPROFILE "gitopsmanager-ca-bundle.pem"
+    $sb = New-Object System.Text.StringBuilder
+    $count = 0
+    foreach ($store in @("Root", "CA")) {
+        foreach ($c in (Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue)) {
+            [void]$sb.AppendLine("-----BEGIN CERTIFICATE-----")
+            [void]$sb.AppendLine([Convert]::ToBase64String($c.RawData, 'InsertLineBreaks'))
+            [void]$sb.AppendLine("-----END CERTIFICATE-----")
+            $count++
+        }
+    }
+    if ($count -eq 0) {
+        Write-Warn2 "No trusted roots could be read from the Windows certificate store."
+        return $false
+    }
+
+    try { [IO.File]::WriteAllText($bundle, $sb.ToString()) }
+    catch { Write-Warn2 "Could not write $bundle -- $($_.Exception.Message)"; return $false }
+
+    $env:REQUESTS_CA_BUNDLE = $bundle    # Azure CLI, and anything else on requests
+    $env:AWS_CA_BUNDLE      = $bundle    # AWS CLI
+    $script:CaBundleApplied = $true
+
+    Write-Good "Exported $count trusted roots from the Windows store to $bundle."
+    Write-Good "Both CLIs now validate against it. Retrying."
+    return $true
+}
+
+# Emitted once, at the end, if the bundle was needed. Setting it for the
+# session is enough to finish this run; saying so avoids the operator
+# discovering tomorrow that it has come undone.
+function Show-CaBundleAdvice {
+    if (-not $script:CaBundleApplied) { return }
+    Write-Host ""
+    Write-Warn2 "This session is using an exported CA bundle because the network re-signs TLS."
+    Write-Warn2 "It lasts for this window only. To keep it for future runs:"
+    Write-Host ""
+    Write-Host "    [Environment]::SetEnvironmentVariable('REQUESTS_CA_BUNDLE', '$env:REQUESTS_CA_BUNDLE', 'User')" -ForegroundColor Cyan
+    Write-Host "    [Environment]::SetEnvironmentVariable('AWS_CA_BUNDLE',      '$env:AWS_CA_BUNDLE', 'User')" -ForegroundColor Cyan
+}
+
 Write-Step "Preflight: sign-in"
 
 # Both are resolved before either is checked, so an operator starting from a
@@ -272,11 +366,35 @@ Install-MissingClis $requiredClis
 
 $signInErrors = @()
 
-try   { $account = az account show 2>$null | ConvertFrom-Json }
-catch { $account = $null }
+$azOut = az account show 2>&1
+if ($LASTEXITCODE -ne 0 -and (Test-TlsTrustFailure $azOut)) {
+    Write-Host ""
+    Write-Warn2 "The Azure CLI could not validate the TLS certificate chain."
+    if (Set-CorporateCaBundle) { $azOut = az account show 2>&1 }
+}
+
+$account = $null
+if ($LASTEXITCODE -eq 0) {
+    try { $account = ($azOut | Out-String) | ConvertFrom-Json } catch { $account = $null }
+}
+
 if ($account) {
     $TenantId = $account.tenantId
     Write-Good "Azure: tenant $TenantId."
+} elseif (Test-TlsTrustFailure $azOut) {
+    $issuer = Get-ServedCertIssuer "https://login.microsoftonline.com/"
+    $signInErrors += @"
+Azure -- the CLI rejected the TLS certificate, and pointing it at the Windows
+trust store did not resolve it.
+
+    certificate issued by : $(if ($issuer) { $issuer } else { "could not be read" })
+
+If that is not a Microsoft CA, this network re-signs TLS and the inspection
+root is not in the Windows store either -- ask whoever runs it for the root
+certificate, save it as a PEM, and set REQUESTS_CA_BUNDLE and AWS_CA_BUNDLE to
+a file containing it. Do not disable certificate verification; this run reads
+and writes client secrets.
+"@
 } else {
     $signInErrors += @"
 Azure -- not signed in. The Entra applications live here, so this is always
@@ -310,8 +428,29 @@ if ($EnableAws) {
         # need for one on calls that do not, sts included.
         $env:AWS_REGION = $AwsRegion
 
-        $AwsAccount = aws sts get-caller-identity --query "Account" --output text 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $AwsAccount) {
+        $stsOut = aws sts get-caller-identity --query "Account" --output text 2>&1
+        if ($LASTEXITCODE -ne 0 -and (Test-TlsTrustFailure $stsOut)) {
+            Write-Host ""
+            Write-Warn2 "The AWS CLI could not validate the TLS certificate chain."
+            if (Set-CorporateCaBundle) {
+                $stsOut = aws sts get-caller-identity --query "Account" --output text 2>&1
+            }
+        }
+        $AwsAccount = if ($LASTEXITCODE -eq 0) { ($stsOut | Out-String).Trim() } else { $null }
+
+        if (Test-TlsTrustFailure $stsOut) {
+            $issuer = Get-ServedCertIssuer "https://secretsmanager.$AwsRegion.amazonaws.com/"
+            $signInErrors += @"
+AWS -- the CLI rejected the TLS certificate, and pointing it at the Windows
+trust store did not resolve it.
+
+    certificate issued by : $(if ($issuer) { $issuer } else { "could not be read" })
+
+If that is not an Amazon CA, this network re-signs TLS and the inspection root
+is not in the Windows store either. Set AWS_CA_BUNDLE to a PEM containing it.
+Do not disable certificate verification.
+"@
+        } elseif (-not $AwsAccount) {
             # On a machine with named profiles this is a selection problem, not
             # a sign-in problem, and "sign in and retry" sends the operator
             # looking in the wrong place. Name what is configured.
@@ -1009,3 +1148,7 @@ Write-Host "   Secret:      $($patch.Origin)"
 Write-Host "   Owns:        $AppName (Application.ReadWrite.OwnedBy)"
 Write-Host " Stores:        $(if ($storesWritten) { $storesWritten -join ',' } else { 'none' })"
 Write-Host "============================================================"
+
+# Only prints if the bundle was actually needed. Says how to make it stick, so
+# the next run on this machine does not rediscover the same problem.
+Show-CaBundleAdvice
