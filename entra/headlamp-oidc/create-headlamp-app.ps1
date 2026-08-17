@@ -386,6 +386,22 @@ if ($KeyVault) {
         if ($softDeleted) {
             Write-Warn2 "A preflight probe was left soft-deleted by an earlier run. Recovering it."
             az keyvault secret recover --vault-name $KeyVault --name $KvProbeName --output none 2>$null | Out-Null
+
+            # Recovery is asynchronous. A set issued before it completes is
+            # rejected with ObjectIsBeingRecovered -- a conflict that reads like
+            # a failure but only means "not yet". Wait for the secret to become
+            # readable instead of retrying straight into it.
+            $recovered = $false
+            foreach ($attempt in 1..12) {
+                az keyvault secret show --vault-name $KeyVault --name $KvProbeName `
+                    --query "id" -o tsv 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $recovered = $true; break }
+                Start-Sleep -Seconds 5
+            }
+            if (-not $recovered) {
+                Stop-With "The preflight probe '$KvProbeName' in '$KeyVault' is still recovering after 60 seconds. Re-run shortly -- no action needed beyond waiting."
+            }
+
             $probeOut = az keyvault secret set --vault-name $KeyVault --name $KvProbeName `
                 --value "probe" --output none 2>&1
         }

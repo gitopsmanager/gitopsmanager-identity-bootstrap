@@ -267,6 +267,26 @@ if [[ -n "$KEY_VAULT_NAME" ]]; then
       warn "A preflight probe was left soft-deleted by an earlier run. Recovering it."
       az keyvault secret recover --vault-name "$KEY_VAULT_NAME" --name "$KV_PROBE_NAME" \
         --output none 2>/dev/null || true
+
+      # Recovery is asynchronous. A set issued before it completes is rejected
+      # with ObjectIsBeingRecovered -- a conflict that reads like a failure but
+      # only means "not yet". Wait for the secret to become readable instead of
+      # retrying straight into it.
+      RECOVERED=false
+      for _ in $(seq 1 12); do
+        if az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "$KV_PROBE_NAME" \
+             --query "id" -o tsv >/dev/null 2>&1; then
+          RECOVERED=true
+          break
+        fi
+        sleep 5
+      done
+      if [[ "$RECOVERED" != "true" ]]; then
+        error "The preflight probe '${KV_PROBE_NAME}' in '${KEY_VAULT_NAME}' is still
+       recovering after 60 seconds. Re-run shortly -- no action needed beyond
+       waiting."
+      fi
+
       PROBE_OUT=$(az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$KV_PROBE_NAME" \
         --value "probe" --output none 2>&1) || true
     fi
