@@ -309,17 +309,63 @@ function Set-CorporateCaBundle {
         return $false
     }
 
-    $bundle = Join-Path $env:USERPROFILE "gitopsmanager-ca-bundle.pem"
-    $sb = New-Object System.Text.StringBuilder
-    $count = 0
-    foreach ($store in @("Root", "CA")) {
-        foreach ($c in (Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue)) {
-            [void]$sb.AppendLine("-----BEGIN CERTIFICATE-----")
-            [void]$sb.AppendLine([Convert]::ToBase64String($c.RawData, 'InsertLineBreaks'))
-            [void]$sb.AppendLine("-----END CERTIFICATE-----")
-            $count++
+    # Every scope, not just LocalMachine\Root. An inspection root can be
+    # deployed to any of them -- a user-mode proxy agent puts it in
+    # CurrentUser\Root, and some installers drop it in Personal -- and
+    # exporting only the machine root store would miss the one certificate
+    # that matters, producing a bundle of 60-odd public roots that fails in
+    # exactly the same way. That is worse than not trying, because it looks
+    # like the fix was applied.
+    #
+    # Deduplicated by thumbprint: the same root commonly appears in more than
+    # one scope, and a PEM containing it twice is valid but confusing to read.
+    $bundle  = Join-Path $env:USERPROFILE "gitopsmanager-ca-bundle.pem"
+    $sb      = New-Object System.Text.StringBuilder
+    $seen    = New-Object 'System.Collections.Generic.HashSet[string]'
+    $notable = New-Object 'System.Collections.Generic.List[string]'
+
+    # $seen, $sb and $notable are reference types deliberately: a nested
+    # function shares the enclosing scope for reads, but assigning to a value
+    # type here would create a local copy and silently lose the result.
+    function Add-Pem {
+        param($Cert, $Origin)
+        if (-not $seen.Add($Cert.Thumbprint)) { return }
+        [void]$sb.AppendLine("-----BEGIN CERTIFICATE-----")
+        [void]$sb.AppendLine([Convert]::ToBase64String($Cert.RawData, 'InsertLineBreaks'))
+        [void]$sb.AppendLine("-----END CERTIFICATE-----")
+        # Anything outside the machine root store is worth naming, so the
+        # operator can see the corporate root was picked up rather than having
+        # to trust a count.
+        if ($Origin -ne "LocalMachine\Root") { $notable.Add("$Origin -> $($Cert.Subject)") }
+    }
+
+    foreach ($scope in @("LocalMachine", "CurrentUser")) {
+        foreach ($store in @("Root", "CA")) {
+            foreach ($c in (Get-ChildItem "Cert:\$scope\$store" -ErrorAction SilentlyContinue)) {
+                Add-Pem $c "$scope\$store"
+            }
         }
     }
+
+    # Personal, filtered to CA certificates only.
+    #
+    # Some proxy agents install their signing root into Personal rather than
+    # Root, where nothing looking for trust anchors would find it. But Personal
+    # is also where user identity lives -- client authentication certificates,
+    # VPN certificates, national ID certificates -- and turning those into
+    # trust anchors for every subsequent TLS call is not something to do by
+    # accident. The basicConstraints CA flag separates the two exactly: a
+    # misfiled signing root has it, an identity certificate does not. Only the
+    # public certificate is read; private keys are never touched.
+    foreach ($scope in @("LocalMachine", "CurrentUser")) {
+        foreach ($c in (Get-ChildItem "Cert:\$scope\My" -ErrorAction SilentlyContinue)) {
+            $bc = $c.Extensions | Where-Object { $_.Oid.Value -eq "2.5.29.19" }
+            if (-not $bc) { continue }
+            if (-not ([System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]$bc).CertificateAuthority) { continue }
+            Add-Pem $c "$scope\My"
+        }
+    }
+    $count = $seen.Count
     if ($count -eq 0) {
         Write-Warn2 "No trusted roots could be read from the Windows certificate store."
         return $false
@@ -333,6 +379,7 @@ function Set-CorporateCaBundle {
     $script:CaBundleApplied = $true
 
     Write-Good "Exported $count trusted roots from the Windows store to $bundle."
+    foreach ($n in $notable) { Write-Good "  includes: $n" }
     Write-Good "Both CLIs now validate against it. Retrying."
     return $true
 }
@@ -481,8 +528,76 @@ AWS -- wrong account.
     }
 }
 
+# -----------------------------------------------------------------------------
+# Data-plane TLS
+#
+# The checks above do not prove TLS to the endpoints this script actually
+# writes to. 'az account show' reads the local token cache and makes no network
+# call at all; Graph, ARM and STS are different hosts from the Key Vault data
+# plane and the Secrets Manager endpoint, and an inspecting proxy does not
+# necessarily treat them alike. A run got all the way through sign-in, Entra,
+# the API and into the Key Vault write before failing on
+# CERTIFICATE_VERIFY_FAILED, by which point the trust fix was never offered.
+#
+# So each enabled store is reached here, over its real endpoint, before
+# anything is written. A permission error is not interesting at this point and
+# is left for the write probe that follows; only a trust failure is acted on.
+# -----------------------------------------------------------------------------
+if ($signInErrors.Count -eq 0) {
+    $planeProbes = @()
+    if ($KeyVault) {
+        $planeProbes += @{
+            Name    = "Key Vault data plane"
+            Host    = "https://$KeyVault.vault.azure.net/"
+            Probe   = { az keyvault secret list --vault-name $KeyVault --maxresults 1 --query "[0].id" -o tsv 2>&1 }
+            Advice  = "Set REQUESTS_CA_BUNDLE to a PEM containing it."
+        }
+    }
+    if ($EnableAws) {
+        $planeProbes += @{
+            Name    = "Secrets Manager"
+            Host    = "https://secretsmanager.$AwsRegion.amazonaws.com/"
+            Probe   = { aws secretsmanager list-secrets --max-results 1 --region $AwsRegion --query "SecretList[0].Name" --output text 2>&1 }
+            Advice  = "Set AWS_CA_BUNDLE to a PEM containing it."
+        }
+    }
+
+    foreach ($p in $planeProbes) {
+        $out = & $p.Probe
+        if (-not (Test-TlsTrustFailure $out)) { continue }
+
+        Write-Host ""
+        Write-Warn2 "$($p.Name): the CLI could not validate the TLS certificate chain."
+
+        # Named up front, before any remediation. .NET validates against the
+        # Windows store, so it can read the certificate the CLI is refusing --
+        # and if the issuer is not the expected cloud provider, that settles
+        # whether the network is re-signing rather than leaving it a theory.
+        $seenIssuer = Get-ServedCertIssuer $p.Host
+        if ($seenIssuer) { Write-Warn2 "  served by: $seenIssuer" }
+
+        if (Set-CorporateCaBundle) { $out = & $p.Probe }
+
+        if (Test-TlsTrustFailure $out) {
+            $issuer = Get-ServedCertIssuer $p.Host
+            $signInErrors += @"
+$($p.Name) -- the CLI rejected the TLS certificate, and pointing it at the
+Windows trust store did not resolve it.
+
+    endpoint              : $($p.Host)
+    certificate issued by : $(if ($issuer) { $issuer } else { "could not be read" })
+
+This network re-signs TLS and the inspection root is not in the Windows store
+either. Ask whoever runs it for the root certificate, save it as a PEM, and
+$($p.Advice) Do not disable certificate verification -- this run reads and
+writes client secrets.
+"@
+        }
+    }
+}
+
 if ($signInErrors.Count -gt 0) {
-    Stop-With ("Not signed in to everything this run needs.`n`n" +
+    Stop-With ("This run cannot reach everything it needs.`n`n" +
                ($signInErrors -join "`n`n") + "`n`nFix all of the above, then re-run.")
 }
 
