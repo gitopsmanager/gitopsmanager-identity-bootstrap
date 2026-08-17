@@ -104,6 +104,42 @@ function Stop-With   { param($m) Write-Error $m ; exit 1 }
 function ConvertTo-B64 { param([string]$s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s)) }
 function ConvertFrom-B64 { param([string]$s) [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }
 
+# Every Graph write goes through here. PowerShell 5.1 does not escape embedded
+# double quotes when handing an argument to a native executable, and this is
+# true of a single-quoted literal just as much as a runtime-built string --
+# '{"api": {"requestedAccessTokenVersion": 2}}' reaches az as
+# {api: {requestedAccessTokenVersion: 2}} and Graph answers "Unable to read
+# JSON request payload". Writing the body to a file and using az's documented
+# @file syntax sidesteps the quoting entirely.
+#
+# The exit-code check is not optional. A failing native command does not throw
+# -- $ErrorActionPreference has no effect on it -- so without this the caller
+# carries straight on and prints its own success line over a write that never
+# happened. That is how a missing Application.ReadWrite.OwnedBy grant would
+# stay hidden until a cluster build failed with 403 hours later.
+function Invoke-GraphJson {
+    param(
+        [ValidateSet("POST", "PATCH", "PUT")]
+        [string] $Method,
+        [string] $Uri,
+        [object] $Body,
+        [string] $ErrorMessage
+    )
+
+    $bodyFile = New-TemporaryFile
+    try {
+        $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Compress -Depth 5 }
+        $json | Set-Content -Path $bodyFile.FullName -Encoding ascii
+
+        az rest --method $Method --uri $Uri `
+            --headers "Content-Type=application/json" `
+            --body "@$($bodyFile.FullName)" | Out-Null
+
+        if ($LASTEXITCODE -ne 0) { Stop-With $ErrorMessage }
+    }
+    finally { Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue }
+}
+
 # Offers to install a missing CLI rather than just naming it. Asks first --
 # installing software on someone's machine is not something to do because a
 # script felt like it.
@@ -311,6 +347,38 @@ function New-AppIfMissing {
     return $newId
 }
 
+# The Entra portal's "Enterprise applications" list defaults to Application
+# type = Enterprise Applications, which shows only service principals carrying
+# this tag. One created by the CLI has no tags, so it is invisible there -- the
+# administrator sees the app registration, finds nothing under Enterprise
+# applications, and concludes the enterprise application was never created. It
+# was; the list is filtered.
+#
+# Applied in Get-OrCreateSp so both service principals get it. The patcher is
+# not a sign-in app and might look like it does not belong in that list, but it
+# holds Application.ReadWrite.OwnedBy, and Enterprise applications ->
+# Permissions is the only place that grant can be reviewed or revoked.
+$PortalTag = "WindowsAzureActiveDirectoryIntegratedApp"
+
+function Set-PortalTag {
+    param([string]$SpId)
+
+    $existing = az ad sp show --id $SpId --query "tags" -o json 2>$null
+    $tags = @()
+    if ($existing) { $tags = @($existing | ConvertFrom-Json) }
+    if ($tags -contains $PortalTag) { return }   # already tagged, leave it alone
+
+    # PATCH replaces tags wholesale, so carry forward any already present.
+    $tags += $PortalTag
+
+    Invoke-GraphJson -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SpId" `
+        -Body @{ tags = $tags } `
+        -ErrorMessage "Could not tag service principal $SpId -- az reported the reason above."
+
+    Write-Good "Tagged as an enterprise application so it appears in the portal list."
+}
+
 function Get-OrCreateSp {
     param([string]$AppId)
     $spId = az ad sp list --filter "appId eq '$AppId'" --query "[0].id" -o tsv 2>$null
@@ -318,6 +386,7 @@ function Get-OrCreateSp {
         $spId = az ad sp create --id $AppId --query "id" -o tsv
         Write-Good "Service principal created: $spId"
     }
+    Set-PortalTag -SpId $spId
     return $spId
 }
 
@@ -335,15 +404,19 @@ if ((az ad sp show --id $SpObjectId --query "appRoleAssignmentRequired" -o tsv 2
 
 if ((az rest --method GET --uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
         --query "api.requestedAccessTokenVersion" -o tsv 2>$null) -ne "2") {
-    az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
-        --body '{"api": {"requestedAccessTokenVersion": 2}}' | Out-Null
+    Invoke-GraphJson -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
+        -Body @{ api = @{ requestedAccessTokenVersion = 2 } } `
+        -ErrorMessage "Could not set the access token version on '$AppName' -- az reported the reason above."
     Write-Good "Access token version set to v2.0."
 }
 
 if ((az rest --method GET --uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
         --query "groupMembershipClaims" -o tsv 2>$null) -ne "SecurityGroup") {
-    az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
-        --body '{"groupMembershipClaims": "SecurityGroup"}' | Out-Null
+    Invoke-GraphJson -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" `
+        -Body @{ groupMembershipClaims = "SecurityGroup" } `
+        -ErrorMessage "Could not set groupMembershipClaims on '$AppName' -- az reported the reason above."
     Write-Good "groupMembershipClaims set to SecurityGroup."
 }
 
@@ -371,10 +444,10 @@ $existingGrant  = az rest --method GET `
                     --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PatchSpId/appRoleAssignments" `
                     --query "value[?appRoleId=='$ownedByRoleId'].id" -o tsv 2>$null
 if (-not $existingGrant) {
-    $grantBody = @{ principalId = $PatchSpId; resourceId = $graphSp; appRoleId = $ownedByRoleId } | ConvertTo-Json -Compress
-    az rest --method POST `
-        --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PatchSpId/appRoleAssignments" `
-        --body $grantBody | Out-Null
+    Invoke-GraphJson -Method POST `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PatchSpId/appRoleAssignments" `
+        -Body @{ principalId = $PatchSpId; resourceId = $graphSp; appRoleId = $ownedByRoleId } `
+        -ErrorMessage "Could not grant Application.ReadWrite.OwnedBy to '$PatchAppName' -- az reported the reason above. Without it the patcher cannot register a cluster's redirect URI, and Headlamp sign-in fails at the end of every build."
     Write-Good "Application.ReadWrite.OwnedBy granted."
 }
 
@@ -448,16 +521,29 @@ function Resolve-Secret {
     if ($AwsValue)   { return @{ Secret = $AwsValue;   Origin = "secrets manager" } }
 
     $credCount = az ad app credential list --id $AppId --query "length(@)" -o tsv 2>$null
-    if ($credCount -and [int]$credCount -gt 0) {
+
+    # Fail closed. The 'credential reset' below is the one destructive call in
+    # this script -- it removes every credential the application already has --
+    # and this count is the only thing standing between it and a live app. When
+    # the query itself fails (expired login, throttling, a directory role that
+    # cannot read credentials) $credCount comes back empty, and reading empty as
+    # "no credentials" would mint straight over the secret every running
+    # Headlamp is authenticating with.
+    if ($LASTEXITCODE -ne 0 -or -not $credCount) {
+        Stop-With "${Label}: could not read the existing credentials from Entra, so minting is not safe -- it would remove any secret this application already holds. Resolve the access problem az reported above and re-run."
+    }
+
+    if ([int]$credCount -gt 0) {
         Stop-With "$Label already has $credCount client secret(s), and Entra does not return one after creation. No enabled store holds it, so it cannot be recovered.`n`nRe-run including the store that does hold it, or rotate deliberately -- a rotation invalidates the credential every running Headlamp is using and needs every cluster refreshed."
     }
 
     Write-Step "Minting a client secret for $Label (valid $SecretYearsValid years)..."
     $endDate = (Get-Date).ToUniversalTime().AddYears($SecretYearsValid).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $pwd = az ad app credential reset --id $AppId --display-name $Label --end-date $endDate --query "password" -o tsv
-    if ($LASTEXITCODE -ne 0 -or -not $pwd) { Stop-With "Could not create a client secret for $Label." }
+    # Not $pwd -- that is an automatic variable in PowerShell.
+    $newSecret = az ad app credential reset --id $AppId --display-name $Label --end-date $endDate --query "password" -o tsv
+    if ($LASTEXITCODE -ne 0 -or -not $newSecret) { Stop-With "Could not create a client secret for $Label." }
     Write-Good "Created."
-    return @{ Secret = $pwd; Origin = "minted" }
+    return @{ Secret = $newSecret; Origin = "minted" }
 }
 
 Write-Step "Resolving credentials"

@@ -249,6 +249,43 @@ ensure_app() {
   printf -v "$__out" '%s' "$app_id"
 }
 
+# The Entra portal's "Enterprise applications" list defaults to Application
+# type = Enterprise Applications, which shows only service principals carrying
+# this tag. One created by the CLI has no tags, so it is invisible there -- the
+# administrator sees the app registration, finds nothing under Enterprise
+# applications, and concludes the enterprise application was never created. It
+# was; the list is filtered.
+#
+# Applied in ensure_sp so both service principals get it. The patcher is not a
+# sign-in app and might look like it does not belong in that list, but it holds
+# Application.ReadWrite.OwnedBy, and Enterprise applications -> Permissions is
+# the only place that grant can be reviewed or revoked.
+PORTAL_TAG="WindowsAzureActiveDirectoryIntegratedApp"
+
+tag_sp_for_portal() {
+  local sp_id="$1" existing_tags all_tags
+
+  existing_tags=$(az ad sp show --id "$sp_id" \
+    --query "join(',', not_null(tags, \`[]\`))" -o tsv 2>/dev/null || true)
+
+  case ",${existing_tags}," in
+    *",${PORTAL_TAG},"*) return 0 ;;   # already tagged, leave it alone
+  esac
+
+  # PATCH replaces tags wholesale, so carry forward any already present rather
+  # than overwriting them.
+  if [[ -n "$existing_tags" ]]; then
+    all_tags="${existing_tags},${PORTAL_TAG}"
+  else
+    all_tags="${PORTAL_TAG}"
+  fi
+
+  az rest --method PATCH \
+    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$sp_id" \
+    --body "{\"tags\": [\"$(echo "$all_tags" | sed 's/,/","/g')\"]}"
+  success "Tagged as an enterprise application so it appears in the portal list."
+}
+
 ensure_sp() {
   local app_id="$1" __out="$2" sp_id
   sp_id=$(az ad sp list --filter "appId eq '$app_id'" --query "[0].id" -o tsv 2>/dev/null || true)
@@ -256,6 +293,7 @@ ensure_sp() {
     sp_id=$(az ad sp create --id "$app_id" --query "id" -o tsv)
     success "Service principal created: $sp_id"
   fi
+  tag_sp_for_portal "$sp_id"
   printf -v "$__out" '%s' "$sp_id"
 }
 
@@ -394,9 +432,21 @@ resolve_secret() {
   if [[ -n "$azure_value" ]]; then RESOLVED_SECRET="$azure_value"; RESOLVED_ORIGIN="key vault"; return; fi
   if [[ -n "$aws_value"   ]]; then RESOLVED_SECRET="$aws_value";   RESOLVED_ORIGIN="secrets manager"; return; fi
 
+  # Fail closed. The 'credential reset' below is the one destructive call in
+  # this script -- it removes every credential the application already has --
+  # and this count is the only thing standing between it and a live app. A
+  # trailing "|| echo 0" here turned a failed query (expired login, throttling,
+  # a directory role that cannot read credentials) into "no credentials", which
+  # would mint straight over the secret every running Headlamp is using.
   local cred_count
-  cred_count=$(az ad app credential list --id "$app_id" --query "length(@)" -o tsv 2>/dev/null || echo 0)
-  if [[ "${cred_count:-0}" -gt 0 ]]; then
+  if ! cred_count=$(az ad app credential list --id "$app_id" --query "length(@)" -o tsv 2>/dev/null) \
+     || [[ -z "$cred_count" ]]; then
+    error "$label: could not read the existing credentials from Entra, so minting
+       is not safe -- it would remove any secret this application already holds.
+       Resolve the access problem and re-run."
+  fi
+
+  if [[ "$cred_count" -gt 0 ]]; then
     error "$label already has ${cred_count} client secret(s), and Entra does not return one
        after creation. No enabled store holds it, so it cannot be recovered.
 
