@@ -495,9 +495,15 @@ function Set-PortalTag {
     # as {"value":[],"Count":0} and Graph rejected the PATCH with "An
     # unexpected 'StartObject' node was found ... A 'PrimitiveValue' node was
     # expected." A typed list of strings cannot take that shape.
+    #
+    # Piped, not -InputObject. A principal that already has tags returns
+    # pretty-printed JSON, which PowerShell captures as a string array, and
+    # -InputObject rejects anything but a single string. The pipeline form
+    # buffers the lines and parses them as one document; it is also what makes
+    # the "[]" case above enumerate to nothing instead of throwing.
     $tags = [System.Collections.Generic.List[string]]::new()
     if ($existing) {
-        foreach ($t in (ConvertFrom-Json -InputObject $existing)) {
+        foreach ($t in ($existing | ConvertFrom-Json)) {
             if ($null -ne $t -and "$t" -ne "") { $tags.Add([string]$t) }
         }
     }
