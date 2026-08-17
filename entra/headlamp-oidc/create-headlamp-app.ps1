@@ -753,16 +753,135 @@ function New-PatchDoc {
 
 $storesWritten = @()
 
+# JSON handed to a native command as an argument loses its double quotes on
+# PowerShell 5.1 -- the same defect that broke the Graph PATCHes. Passing a
+# compressed manifest as --value stored {apiVersion:v1,kind:Secret,...} in Key
+# Vault instead of {"apiVersion":"v1",...}: unparseable, and silent, because
+# the store accepted the string quite happily and only the next run's read
+# failed. Both CLIs can take the value from a file, which sidesteps quoting
+# entirely.
+#
+# Written without a BOM. Both CLIs treat the file as raw text, so a BOM would
+# be carried into the stored secret and break the JSON parse at the far end --
+# in the cluster, not here.
+function New-JsonTempFile {
+    param([string] $Json)
+    $f = New-TemporaryFile -ErrorAction Stop
+    [System.IO.File]::WriteAllText($f.FullName, $Json, (New-Object System.Text.UTF8Encoding($false)))
+    return $f.FullName
+}
+
+# Compare content, not bytes. A document written by earlier tooling has the
+# same meaning but different spacing and key order, and a string comparison
+# calls that "changed" -- so the script rewrote a perfectly good secret, and
+# minted a new Key Vault version, for a difference that did not exist. That
+# needless write is what put a corrupt document over a working one.
+#
+# Sorting the properties makes the comparison order-insensitive; an unparseable
+# stored document is never equivalent, so a corrupt value is always replaced.
+function ConvertTo-CanonicalJson {
+    param($Obj)
+    if ($null -eq $Obj) { return "null" }
+    if ($Obj -is [string] -or $Obj -is [bool] -or $Obj -is [int] -or
+        $Obj -is [long]   -or $Obj -is [double]) {
+        return ($Obj | ConvertTo-Json -Compress)
+    }
+    if ($Obj -is [System.Collections.IEnumerable]) {
+        return "[" + (($Obj | ForEach-Object { ConvertTo-CanonicalJson $_ }) -join ",") + "]"
+    }
+    $parts = foreach ($p in ($Obj.PSObject.Properties | Sort-Object Name)) {
+        (ConvertTo-Json $p.Name -Compress) + ":" + (ConvertTo-CanonicalJson $p.Value)
+    }
+    return "{" + ($parts -join ",") + "}"
+}
+
+function Test-JsonEquivalent {
+    param($A, $B)
+    if (-not $A -or -not $B) { return $false }
+    try {
+        $x = ConvertTo-CanonicalJson ((($A -join '')) | ConvertFrom-Json)
+        $y = ConvertTo-CanonicalJson ((($B -join '')) | ConvertFrom-Json)
+    } catch { return $false }
+    return $x -eq $y
+}
+
+# Pulls the credential out of either document shape: the k8s Secret manifest,
+# where it is base64 under data.clientSecret, or the flat patcher document.
+function Get-DocSecret {
+    param($Doc)
+    if (-not $Doc) { return $null }
+    try {
+        $d = (($Doc -join '')) | ConvertFrom-Json
+        if ($d.data -and $d.data.clientSecret) { return ConvertFrom-B64 $d.data.clientSecret }
+        if ($d.clientSecret) { return [string]$d.clientSecret }
+    } catch { }
+    return $null
+}
+
+# A stored credential is never replaced with a different one. Non-secret fields
+# may legitimately drift -- key order, scopes, useAccessToken -- and rewriting
+# those is harmless. Replacing the credential is not: every Headlamp already
+# running is authenticating with the stored value, and overwriting it breaks
+# them all at once, silently, until someone tries to sign in.
+#
+# Writing where nothing is stored, or where the stored document cannot be
+# parsed, is allowed -- that is a create or a repair, not a replacement.
+function Assert-NoSecretReplacement {
+    param($Name, $Existing, $Want)
+
+    $have = Get-DocSecret $Existing
+    if (-not $have) { return }
+
+    $new = Get-DocSecret $Want
+    if ($have -eq $new) { return }
+
+    $newHint = if ($new) { $new.Substring(0, [Math]::Min(3, $new.Length)) + "..." } else { "(none)" }
+    Stop-With @"
+Refusing to replace the credential already stored in $Name.
+
+    stored      : $($have.Substring(0, [Math]::Min(3, $have.Length)))...
+    would write : $newHint
+
+Whatever is already authenticating with the stored credential would stop doing
+so. Nothing has been written.
+
+If the replacement is intended, rotate deliberately and refresh every cluster
+that holds a copy -- the Entra credential, both stores, and each cluster's
+headlamp-oidc secret.
+"@
+}
+
 if ($KeyVault) {
     Write-Step "Key Vault"
     $wantOidc  = New-Manifest -UseAccessToken $true
     $wantPatch = New-PatchDoc
-    if ($wantOidc -ne $kvOidcDoc) {
-        az keyvault secret set --vault-name $KeyVault --name $KvOidcName --value $wantOidc --output none
+
+    function Set-KvSecret { param($Name, $Value)
+        $tmp = New-JsonTempFile $Value
+        try {
+            az keyvault secret set --vault-name $KeyVault --name $Name --file $tmp --output none
+            if ($LASTEXITCODE -ne 0) { Stop-With "Could not write $Name to Key Vault '$KeyVault'." }
+        }
+        finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+
+        # Read back before moving on. A store accepting the call is not proof it
+        # holds what was sent: a quote-stripped document was stored here once,
+        # az reported success, and it only surfaced on the next run's read --
+        # by which point the good version was one back in the history.
+        $back = az keyvault secret show --vault-name $KeyVault --name $Name --query "value" -o tsv 2>$null
+        if (-not (Test-JsonEquivalent $Value $back)) {
+            Stop-With "Wrote $Name to Key Vault '$KeyVault', but reading it back returned something different. Stopping before anything else is touched. The previous value is still in the vault's version history."
+        }
+    }
+
+    if (-not (Test-JsonEquivalent $wantOidc $kvOidcDoc)) {
+        Assert-NoSecretReplacement $KvOidcName $kvOidcDoc $wantOidc
+        Set-KvSecret $KvOidcName $wantOidc
         Write-Good "$KvOidcName written."
     } else { Write-Good "$KvOidcName already current." }
-    if ($wantPatch -ne $kvPatchDoc) {
-        az keyvault secret set --vault-name $KeyVault --name $KvPatchName --value $wantPatch --output none
+    if (-not (Test-JsonEquivalent $wantPatch $kvPatchDoc)) {
+        Assert-NoSecretReplacement $KvPatchName $kvPatchDoc $wantPatch
+        Set-KvSecret $KvPatchName $wantPatch
         Write-Good "$KvPatchName written."
     } else { Write-Good "$KvPatchName already current." }
     $storesWritten += "azure"
@@ -776,18 +895,36 @@ if ($EnableAws) {
     $wantOidc  = New-Manifest -UseAccessToken $false
     $wantPatch = New-PatchDoc
 
+    # file:// for the same reason Key Vault uses --file: a compressed JSON
+    # argument reaches the CLI with its double quotes stripped.
     function Set-SmSecret { param($Name, $Value)
-        aws secretsmanager put-secret-value --secret-id $Name --secret-string $Value --region $AwsRegion 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            aws secretsmanager create-secret --name $Name --secret-string $Value --region $AwsRegion | Out-Null
-            if ($LASTEXITCODE -ne 0) { Stop-With "Could not write $Name to Secrets Manager." }
+        $tmp = New-JsonTempFile $Value
+        try {
+            aws secretsmanager put-secret-value --secret-id $Name --secret-string "file://$tmp" --region $AwsRegion 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                aws secretsmanager create-secret --name $Name --secret-string "file://$tmp" --region $AwsRegion | Out-Null
+                if ($LASTEXITCODE -ne 0) { Stop-With "Could not write $Name to Secrets Manager." }
+            }
+        }
+        finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+
+        # Read back, for the same reason Key Vault does.
+        $back = aws secretsmanager get-secret-value --secret-id $Name --region $AwsRegion --query "SecretString" --output text 2>$null
+        if (-not (Test-JsonEquivalent $Value $back)) {
+            Stop-With "Wrote $Name to Secrets Manager, but reading it back returned something different. Stopping before anything else is touched."
         }
     }
 
-    if ($wantOidc -ne $smOidcDoc) { Set-SmSecret $SmOidcName $wantOidc; Write-Good "$SmOidcName written." }
-    else { Write-Good "$SmOidcName already current." }
-    if ($wantPatch -ne $smPatchDoc) { Set-SmSecret $SmPatchName $wantPatch; Write-Good "$SmPatchName written." }
-    else { Write-Good "$SmPatchName already current." }
+    if (-not (Test-JsonEquivalent $wantOidc $smOidcDoc)) {
+        Assert-NoSecretReplacement $SmOidcName $smOidcDoc $wantOidc
+        Set-SmSecret $SmOidcName $wantOidc
+        Write-Good "$SmOidcName written."
+    } else { Write-Good "$SmOidcName already current." }
+    if (-not (Test-JsonEquivalent $wantPatch $smPatchDoc)) {
+        Assert-NoSecretReplacement $SmPatchName $smPatchDoc $wantPatch
+        Set-SmSecret $SmPatchName $wantPatch
+        Write-Good "$SmPatchName written."
+    } else { Write-Good "$SmPatchName already current." }
     $storesWritten += "aws"
 }
 
