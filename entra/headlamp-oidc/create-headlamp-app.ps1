@@ -363,11 +363,40 @@ if ($KeyVault) {
     if ($LASTEXITCODE -ne 0) { Stop-With "Key Vault '$KeyVault' not found or not accessible." }
 
     # Prove write, do not assume it.
-    az keyvault secret set --vault-name $KeyVault --name $KvProbeName --value "probe" --output none 2>$null
+    #
+    # The probe is deliberately NOT deleted afterwards. Key Vault soft-delete
+    # reserves a deleted name for the retention period -- 90 days by default --
+    # and 'secret set' against a name in that state fails with a conflict, not
+    # a permission error. Deleting the probe each run therefore made the
+    # preflight work exactly once, and every run after that reported "Cannot
+    # write to Key Vault, grant Key Vault Secrets Officer" at operators who
+    # already had it. One probe secret left in the vault, named for what it is,
+    # costs less than a preflight that only works the first time.
+    $probeOut = az keyvault secret set --vault-name $KeyVault --name $KvProbeName `
+        --value "probe" --output none 2>&1
+
     if ($LASTEXITCODE -ne 0) {
-        Stop-With "Cannot write to Key Vault '$KeyVault'. Grant Key Vault Secrets Officer and retry."
+        # Clean up after the version of this script that did delete the probe.
+        # Recover rather than purge: recovery needs no purge permission and
+        # works on vaults with purge protection enabled, where purging a
+        # soft-deleted secret is impossible and the name would otherwise be
+        # unusable until the retention period expired.
+        $softDeleted = az keyvault secret list-deleted --vault-name $KeyVault `
+            --query "[?name=='$KvProbeName'].name" -o tsv 2>$null
+        if ($softDeleted) {
+            Write-Warn2 "A preflight probe was left soft-deleted by an earlier run. Recovering it."
+            az keyvault secret recover --vault-name $KeyVault --name $KvProbeName --output none 2>$null | Out-Null
+            $probeOut = az keyvault secret set --vault-name $KeyVault --name $KvProbeName `
+                --value "probe" --output none 2>&1
+        }
     }
-    az keyvault secret delete --vault-name $KeyVault --name $KvProbeName --output none 2>$null | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        # Report what az said rather than naming a cause. Asserting "grant Key
+        # Vault Secrets Officer" is what sent someone holding Key Vault
+        # Administrator into the portal looking for a role they already had.
+        Stop-With "Cannot write to Key Vault '$KeyVault'.`n`naz reported:`n`n$probeOut"
+    }
     Write-Good "Key Vault writable."
 }
 
